@@ -1,178 +1,495 @@
 library(shiny)
 
-### CODE FOR SHINY APP #########################################################
-# This code is written to build a website through Shiny App.
-################################################################################
+###############################################################################
+#                         TLEseq SHINY APPLICATION                            #
+#                            test-app.R                                                                             #
+# Interactive web app for exploring Xenium spatial transcriptomics data from  #
+# a temporal lobe epilepsy (TLE) study.                                       #
+#                                                                             #
+# Methodology adapted from Larissa's medial temporal lobe epilepsy paper.     #
+# Requires: a pre-processed Seurat object (.rds) and a precomputed data       #
+# bundle (precomputed_app_data.rds).                                          #
+# Code written by Hope L, uses custom functions from Larissa K                #
+# May 2026                                                                    #
+###############################################################################
 
-#### 0) SETUP ##################################################################
+
+###############################################################################
+# SECTION 0: PACKAGE LOADING & GLOBAL OPTIONS                                 #
+###############################################################################
+
 suppressPackageStartupMessages({
-  library(Seurat)        # main package for Seurat objects and plotting
-  library(dplyr)         # data wrangling
-  library(tidyr)         # pivot_longer / pivot_wider
-  library(ggplot2)       # plotting backbone
-  library(patchwork)     # combine ggplots with / and wrap_plots()
-  library(scCustomize)   # custom Seurat plotting helpers, e.g. VlnPlot_scCustom
-  library(colorspace)    # color manipulation if needed later
-  library(grid)          # helps allow the text box for cluster selection to download properly
-  library(gridExtra)     # arranging multiple plots
-  library(rlang)         # helper infrastructure used by some functions
-  library(stringr)       # string handling
-  library(scales)        # scaling helpers for plots
-  library(dittoSeq)      # used indirectly for palettes in this project
-  library(RColorBrewer)  # color palette utilities
-  library(tibble)        # helps with deframe()
+  library(shiny)
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+  library(rlang)
+  library(scattermore)
 })
 
-# Increase allowed object size for large Seurat objects.
 options(future.globals.maxSize = 25000 * 1024^2)
 
-### LOAD DATA ##################################################################
-dat <- readRDS('X:/CembrowskiLab/Hope Luo/MegaData_v6_annotated.rds')
 
-#template list, fill in as needed for the website
+###############################################################################
+# SECTION 1: LOAD & PREPARE THE MAIN SEURAT OBJECT                           #
+###############################################################################
+
+dat <- readRDS("/data/MegaData_v8_annotated_smaller_trimmed.rds")
+
+# Set default assay to Xenium
+DefaultAssay(dat) <- "Xenium"
+
+# The app only needs the FOV names from the images slot (spatial coordinates
+# come from precomputed_app_data.rds), so keep the names and drop the images.
+# This also avoids the Seurat bug where JoinLayers validates FOV boundaries
+# even though images are unrelated to layer joining.
+fov_names <- names(dat@images)
+dat@images <- list()
+
+# Nothing below reads anything except the normalized "data" layer of the
+# Xenium assay, the UMAP and the metadata, so the rest is dropped to cut
+# memory use. Each removal is tried on a copy and kept only if the Xenium
+# assay and the UMAP are still intact; a Seurat version that handles one of
+# them differently just leaves that piece in memory.
+drop_if_safe <- function(obj, label, drop_fn) {
+  tryCatch({
+    out <- drop_fn(obj)
+    stopifnot(identical(dim(out[["Xenium"]]), dim(obj[["Xenium"]])),
+              "umap" %in% Reductions(out))
+    out
+  }, error = function(e) {
+    message("Not dropped (", label, "): ", conditionMessage(e))
+    obj
+  })
+}
+
+# Other assays, graphs and non-UMAP reductions go first, so they are already
+# out of memory during the join / normalize peak.
+for (.a in setdiff(Assays(dat), "Xenium"))
+  dat <- drop_if_safe(dat, paste("assay", .a), function(x) { x[[.a]] <- NULL; x })
+for (.g in Graphs(dat))
+  dat <- drop_if_safe(dat, paste("graph", .g), function(x) { x[[.g]] <- NULL; x })
+for (.r in setdiff(Reductions(dat), "umap"))
+  dat <- drop_if_safe(dat, paste("reduction", .r), function(x) { x[[.r]] <- NULL; x })
+
+dat <- JoinLayers(dat)
+dat <- NormalizeData(dat, assay = "Xenium")
+dat <- JoinLayers(dat)
+
+# Raw counts (and scaled data, if present) were only needed to normalize.
+for (.l in setdiff(Layers(dat[["Xenium"]]), "data"))
+  dat <- drop_if_safe(dat, paste("layer", .l), function(x) {
+    LayerData(x, assay = "Xenium", layer = .l) <- NULL
+    x
+  })
+
+rm(.a, .g, .r, .l)
+invisible(gc())
+message("Seurat object in memory: ", format(object.size(dat), units = "GB"))
+
+
+###############################################################################
+# SECTION 2: ILAE SCORE CLEANUP & COLOR PALETTE                              #
+###############################################################################
+
+dat@meta.data$ILAE_score[dat@meta.data$ILAE_score == "P"] <- "postmortem/control"
+
+read_named_palette <- function(csv_path) {
+  pal <- read.csv(csv_path, stringsAsFactors = FALSE)
+  setNames(pal$x, pal$X)
+}
+
+pal_celltype <- read_named_palette("/data/pal_celltype.csv")
+
+
+###############################################################################
+# SECTION 3: CONFIGURATION CONSTANTS                                         #
+###############################################################################
+
 cfg <- list(
-  megadata_rds         = "X:/CembrowskiLab/Hope Luo/MegaData_v6_annotated.rds",
-  pal_dir              = "X:\\CembrowskiLab\\Hope Luo\\Analysis\\palettes",
-  out_plot_dir         = "path/to/directory/plots/MegaData_v6",
-  out_imagedim_dir     = "path/to/directory/plots/MegaData_v6/ImageDimPlot",
-  out_imagedim_png_dir = "path/to/directory/plots/MegaData_v6/ImageDimPlot_png",
-  out_imagefeature_dir = "path/to/directory/plots/MegaData_v6/ImageFeaturePlots_bestPC1",
-  sample_order         = c("L10", "L5", "M70", "B1", "F1",
-                           "H1", "I1", "J1", "L20",
-                           "C1", "C2", "E008", "L14", "L15",
-                           "L18", "L1", "L21", "L3"),
-  fov_order            = c("L10", "L5", "M70", "B1", "F1",
-                           "H1", "I1", "J1", "L20",
-                           "C1", "C2", "E008", "L14", "L15",
-                           "L18", "L1", "L21", "L3"),
-  marker_features      = c("SNAP25", "SLC17A7", "GAD1", "AQP4", "P2RY12",
-                           "MOBP", "PDGFRA", "FLT1", "FBLN1"),
-  featureplot_genes    = c("PSENEN", "KCNQ3"),
-  featureplot_fovs     = c("M70", "I1", "L15", "L1")
+  sample_order = c("L10", "L5", "M70", "B1", "F1",
+                   "H1", "I1", "J1", "L20",
+                   "C1", "C2", "E008", "L14", "L15",
+                   "L18", "L1", "L21", "L3")
 )
 
-# Orders metadata into set list that will be consistently displayed
+
+###############################################################################
+# SECTION 4: APPLY FACTOR LEVELS TO METADATA                                 #
+###############################################################################
+
 apply_plotting_factors <- function(dat, sample_order) {
-  if ("type" %in% colnames(dat@meta.data)) {
+  if ("type"     %in% colnames(dat@meta.data))
     dat$type <- factor(dat$type, levels = c("epilepsy", "postmortem"))
-  }
-  if ("Sample" %in% colnames(dat@meta.data)) {
+  if ("Sample"   %in% colnames(dat@meta.data))
     dat$Sample <- factor(dat$Sample, levels = sample_order)
-  }
-  if ("celltype" %in% colnames(dat@meta.data)) {
-    dat$celltype <- factor(
-      dat$celltype,
-      levels = c("ExN", "InN", "Astro", "Micro", "Oligo", "OPC", "Vascular", "CSF")
-    )
-  }
+  if ("celltype" %in% colnames(dat@meta.data))
+    dat$celltype <- factor(dat$celltype,
+                           levels = c("ExN","InN","Astro","Micro",
+                                      "Oligo","OPC","Vascular","CSF"))
   return(dat)
 }
 
 dat <- apply_plotting_factors(dat, sample_order = cfg$sample_order)
 
-### 0) LOAD DATA PROCESSING ####################################################
+
+###############################################################################
+# SECTION 5: SET FINE-GRAINED SUBTYPE ANNOTATION                             #
+###############################################################################
+
+dat$cellsubtype <- dat$cellsubtype_fine
+
+
+###############################################################################
+# SECTION 6: SET ACTIVE IDENTS & BUILD MARKER GENE LISTS                     #
+###############################################################################
+
 Idents(dat) <- dat$seurat_clusters
 
-#Find significant markers for each cluster
-prep_FindMarkers <- function(obj, num_slices = 8) {
-  for (i in 1:num_slices) {
-    slot(object = obj@assays$SCT@SCTModel.list[[i]], name = "umi.assay") <- "Xenium"
-  }
-  obj <- obj %>% PrepSCTFindMarkers()
-  return(obj)
-}
+marker_list <- list(
+  "Cluster 0: Oligo" = c(
+    "MAG","MYRF","MOG","CNTN2","CNDP1","OPALIN","ST18","PCSK6",
+    "CLDN11","MOBP","UGT8","ERMN","KLK6","MAL","CAPN3","ERBB3",
+    "CTNNA3","ANKRD18A","SOX10","KCNJ2","PSEN1","FGFR2","ADARB2",
+    "HHATL","CDH1","EFHD1","SLC12A2","DLG1","HCN2","DLG2",
+    "OLIG1","PTPRK","OLIG2","UNC5B","PROX1","NHLH2","PLD5",
+    "CRHBP","NTNG2","APP","GRIA4","DNER","NCSTN","MEIS2"),
+  "Cluster 1: Astro" = c(
+    "RYR3","FGFR3","SFRP2","WIF1","AQP4","SERPINA3","GJA1","TRIL",
+    "GRIN2C","SOX9","PAX6","MGST1","SPON1","CTSH","HILPDA","SOX2",
+    "TTYH1","TGFB2","GABRA2","ELOVL2","APOE","RORB","ANGPT1","VCAN",
+    "FOXG1","GABBR1","GABRG1","EGFR","PTPRZ1","CDH4","NOTCH1","BCAN",
+    "CCL2","PLCH1","ABCC9","IDH2","ADRA1A","HES1","CNTNAP3B","NTNG2",
+    "IGFBP5","PLCE1","GRIK4","NTNG1","MEIS2","KIT","DNER","CXCL14",
+    "KCNMA1","IFITM3","ANXA1","RGS16","STAT3","RSPO2","HOMER2","GRIK5",
+    "LYPD6","SOX11","HHATL","MYO16","BRINP3","SYNGAP1"),
+  "Cluster 2: Micro" = c(
+    "ITGAX","CCL4","RNASET2","GPR34","FCGR1A","ITGAM","LRRK1","CD83",
+    "CX3CR1","P2RY13","GPR183","P2RY12","PTPRC","CD163","CD86","TREM2",
+    "HLA-DQA1","ITGB2","MS4A6A","FCGR3A","SPI1","CD14","HLA-DMB","CTSS",
+    "LYVE1","RGS10","LY86","FCER1G","TMIGD3","IL1A","CORO1A","CD68",
+    "STXBP2","ARHGAP24","AIF1","CD4","TGFB1","CD52","C1orf162","HAVCR2",
+    "LCP2","GNLY","CXCR4","TOP2A","CYTIP","CAPG","MKI67","CDK1",
+    "GPNMB","NR4A2","CCNB2","CENPF","LRRK2","HS3ST4","MCTP2","SDK1",
+    "PCNA","KCNQ3","CCL2","RGS16","TGFBI","TP53","CD48","GAS2L3",
+    "PDGFD","TESPA1","STK32B","CD3G","RFTN1","ADGRG6","IDH1","RNF144B",
+    "BARD1","KCNMA1","CTSH","APOE","ERC1","CHRNA7","NCSTN","NRP1",
+    "S100A4","RASGRP1","PSENEN","NPY1R","MYO5B","STAT3","SHANK1","RIMS1",
+    "PSEN2","SOX4","CD36","RIMS2","CRHBP","SNTB2","TRPC6","GRIK5"),
+  "Cluster 3: ExN" = c(
+    "C1QL3","GABRB3","SLC17A7","GABRA5","GABRG2","GRIA1","CALB1","GRIN2B",
+    "GRIN1","SPHKAP","SNAP25","SLC12A5","GABBR2","CRYM","LAMP5","SYNPR",
+    "GRIA2","SEMA5A","ADAMTS16","COL25A1","ERC2","SCN8A","GABRB2","GRIN2A",
+    "KCNQ2","NNAT","KCNA1","GRM1","PCP4","PCSK1","SLC24A3","SHISA9",
+    "GABRA1","DLG4","DLG3","ADRA1A","ANO3","CACNA1B","RASGRP1","GRIA3",
+    "CCK","SHISA6","POSTN","TSHZ2","SYNGAP1","MC4R","GRM5","HS3ST2",
+    "KIT","TRHDE","NPY1R","B4GALNT1","HCN1","NPY2R","HOMER1","HS3ST4",
+    "NRP1","APP","ADRA1B","SHANK1","SHANK2","KCNQ3","SPON1","PROX1",
+    "GRIK2","GABRA2","PPFIBP1","FOXG1","GABBR1","KCNMA1","CACNB3","SNCG",
+    "RIMS1","SLIT3","GRIK5","FILIP1","LYPD1","ITGA8","RIMS2"),
+  "Cluster 4: Vascular" = c(
+    "FLT1","IGFBP3","DCN","THBS1","FN1","CEMIP","CDH6","PHLDB2",
+    "IGFBP4","CAV1","PECAM1","KLF2","THSD4","KLF4","FRZB","NR2F2",
+    "CACNA1H","SLIT3","CEMIP2","RNF144B","LAMA2","SHANK3","IFITM3","ADGRG6",
+    "ITGA8","NES","S100A4","CALCRL","COL12A1","NPNT","THSD7B","FILIP1",
+    "PLCE1","HES1","PPFIBP1","NRP1","ABCC9","DDR2","PSEN2","TRPC6",
+    "CSPG4","RFTN1","FBLN1","PTN","TGFBI","ANXA1","STAT3","NPY1R",
+    "CNTNAP3B","TMEM132C","SAMD5","CACNB3","IGFBP5","SCN7A","ERC1","HOMER2",
+    "SNTB2","LHX6","NOTCH1","NDNF","EGFR","LRRK2","NR4A2","PTPRK",
+    "TP53","ANGPT1","TSHZ2","TGFB1","HILPDA","CD4","SLC12A2","GPNMB",
+    "SOX4","SNCG","LYVE1","UNC5B","LCP2","NCSTN","SDK1","SHANK1",
+    "RGS16","SULF1","BARD1","PSENEN","ANO3","HOMER1","PDGFD","ADRA1B",
+    "TGFB2","MCTP2","B4GALNT1"),
+  "Cluster 5: OPC" = c(
+    "PDGFRA","ATP2C2","BRINP3","CACNA1A","CSPG4","BCAN","PTPRZ1","SORCS1",
+    "VCAN","STK32B","TENM1","CACNA1G","SCN1A","SOX4","GRIK3","OLIG2",
+    "GRIA4","GRM5","GRIK2","GRIK1","TMEM132C","POU6F2","OLIG1","SOX11",
+    "ALK","SHISA9","SEMA5A","CALCRL","LYPD1","GRIA3","RIT2","EGFR",
+    "NTNG1","MYO16","DNER","GRIK4","KCNMA1","SCN7A","KCNA1","SOX10",
+    "GRIA2","GRIK5","PTN","IDH1","KCNQ2","SOX2","GPNMB","GABBR1",
+    "FOXG1","CHRNA4","SLC24A3","OTOGL","RIMS2","ITGA8","GAD1","CDH4",
+    "MEIS2","CACNA2D2","PLD5","LRRK2","TP73","COL12A1","SHANK1","RIMS1",
+    "HOMER1","PLCE1","ERBB3","ERC2","SHISA6","SHANK2","BARD1"),
+  "Cluster 6: InN" = c(
+    "CALB2","RELN","VIP","CXCL14","GAD2","CCK","GAD1","NDNF",
+    "BTBD11","SYNPR","GRIK2","CHRNA7","RXFP1","CPLX3","CACNA1B","NXPH2",
+    "THSD7B","KIT","GRIK1","GABRA1","GRIN3A","SORCS1","LYPD6","ALK",
+    "GABRB2","HTR2C","GABBR2","ADARB2","SLC12A5","GRIN2A","GRIN1","GRIA4",
+    "PLD5","NTNG1","LAMP5","PROX1","SHISA9","GABRG2","FOXG1","NR2F2",
+    "DNER","GRIA1","GRIN2B","SNAP25","GRIA2","APP","SCN1A","MYO16",
+    "ADRA1B","GRM1","VWC2L","SST","SHANK1","PTCHD4","TACR1","ANK1",
+    "SHISA6","LYPD6B","KCNQ3","CALB1","CHRNA4","KCNQ2","LYPD1","CACNA1G",
+    "GRM5","COL12A1","SLC24A3","COL25A1","SHANK2","RIMS2","SCN7A","GABBR1",
+    "HCN1","STK32B","RIMS1","NPY1R","HOMER2","DLG3","B4GALNT1","SNCG",
+    "CACNA2D2","ERC2","IGFBP5","RGS16","DLG4","TRPC6","PDGFD","SOX11",
+    "CACNB3","TAC1","GABRG1","SCN8A"),
+  "Cluster 7: InN" = c(
+    "SST","TAC1","NPY","LHX6","GAD2","PVALB","GAD1","CRHBP",
+    "GRIK1","TACR1","BTBD11","MEPE","SCN1A","NXPH2","CHRM2","GRIN3A",
+    "CACNA2D2","GRIK3","HCN1","PLCH1","TRHDE","SYNPR","SNCG","GABRA1",
+    "CALB1","ALK","GRIA4","LAMP5","COL25A1","ANK1","GRIK2","GABRB2",
+    "MYO16","LYPD6","GRIA1","SLC12A5","GABBR2","CCK","GRIN1","GRM5",
+    "GRM1","CACNA1B","GABRG2","KCNQ3","SNAP25","SCN8A","GRIN2A","RELN",
+    "GRIN2B","DNER","APP","GABBR1","PTCHD4","GRIA3","KIT","TENM1",
+    "SHISA6","CUX2","KCNQ2","DLG3","RXFP1","NTNG1","RIT2","MYO5B",
+    "SPHKAP","RIMS2","PDGFD","RIMS1","SHANK1","MC4R","CACNA1G","SCN7A",
+    "HTR2A","SHANK2","ERC2","KCNMA1","RSPO2","STK32B","DLG4","CACNA1A",
+    "SHISA9","B4GALNT1","TRPC6","HTR2C","NPY2R","SLC24A3","SULF1","CNTNAP3B",
+    "VIP","PLD5"),
+  "Cluster 8: ExN" = c(
+    "NTS","HCN1","CRYM","GABRA1","ANO3","GRIK1","SCN8A","PCSK1",
+    "GRIA3","NNAT","SPHKAP","LYPD1","GABRB2","GRIN2B","SLC12A5","SLC17A7",
+    "GRIN1","HOMER1","GABBR2","GRIN2A","SCN1A","GRIK2","SNAP25","GABRG2",
+    "GRIA1","C1QL3","DLG3","KCNQ2","GRIA2","GABRB3","FN1","LAMP5",
+    "DLG4","APP","SYNGAP1","SLC24A3","TESPA1","CHODL","GRM5","PCP4",
+    "GABRA2","HS3ST2","GABRA5","CCK","RIT2","COL25A1","KIT","FOXG1",
+    "GABBR1","NTNG1","CACNA1B","B4GALNT1","POSTN","SHANK1","SHANK2","SNCG"),
+  "Cluster 9: CSF" = c(
+    "CD36","ZBBX","CCNA1","ANXA1","NTS","EYA4","TP73","LOX",
+    "NNAT","GABRG1","MGST1","PLCH1","TRPC6","PSENEN","SDK1","SHANK2",
+    "MEIS2","TGFB2","SULF1","SYNGAP1","HILPDA","HES1","NR4A2","SCN1A",
+    "SOX2","SOX9","KCNMA1","SERPINA3","ANGPT1","FBLN1","PAX6","GJA1",
+    "TRIL","DNER","IGFBP5","AQP4","IDH2","IFITM3","ABCC9","PLCE1",
+    "RSPO2","DDR2","FRZB","GPNMB","SOX4","RGS16","SOX11","LYPD1",
+    "CNTNAP3B","TSHZ2","GRIK4","STAT3","PTPRC","CD68","THBS1","CCL2",
+    "CAPG","NCSTN","FILIP1","SLIT3","PCNA","CENPF","HTR2C","HTR2A",
+    "MYO5B","ATP2C2","MYO16","NES","HOMER2","LYPD6","RFTN1","CDH4",
+    "NHLH2","GRIN2A","GRIK5"),
+  "Cluster 10: CSF" = c(
+    "HTR2C","FBLN1","SULF1","CUX2","PCP4","HOMER2","TGFBI","PLD5",
+    "NDNF","DDR2","SHANK2","PDGFD","TP73","GPNMB","EYA4","FRZB",
+    "CDH1","PSENEN","ZBBX","MYO5B","SNTB2","DNER","IDH1","IDH2",
+    "FGFR2","TMEM132C","NNAT","SOX9","SLC12A2","APP","PLCH1","SERPINA3",
+    "HTR2A","IFITM3","IGFBP5","TRPC6","PLCE1","CEMIP","CHRNA7","HOMER1",
+    "SDK1","STXBP2","NCSTN","ABCC9","KCNH5","ZDHHC23","PSEN2","PCNA",
+    "NR2F2","BTBD11","SYNGAP1","DLG3","CACNA2D2","TGFB2","STAT3","CNTNAP3B",
+    "DLG4"),
+  "Cluster 11: Micro" = c(
+    "CCL5","IL7R","TRAC","GZMA","CD2","NKG7","CD3D","KLRB1",
+    "THEMIS","CD48","CD3G","PDCD1","CYTIP","FASLG","CXCR4","CD52",
+    "GNLY","S100A4","MCTP2","TESPA1","RASGRP1","CORO1A","LCP2","PTPRC",
+    "SNTB2","CCNB2","PDGFD","TOP2A","MKI67","CDK1","CENPF","HLA-DQA1",
+    "RFTN1","ITGB2","TP53","TGFB1","STXBP2","PCNA","ANXA1","CTSS",
+    "CCL4","HLA-DMB","DCN","CEMIP2","CD4","GPR183","BARD1","TGFBI",
+    "RGS10","IFITM3","STAT3","LY86","CAPG","CEMIP","GPNMB","C1orf162",
+    "FCER1G","FBLN1","MYO5B","CTSH","CD68","PHLDB2","ERC1","PSENEN",
+    "LYVE1","DDR2","LRRK1","KLF2","SPI1","CD86","IGFBP4","KCNS1",
+    "CD163","CACNA2D2","FCGR3A","IDH1","NCSTN","LOX","DLG3","MS4A6A",
+    "BTBD11","COL12A1","SCN7A","IDH2","CACNB3","TRPC6","ADGRG6","RNF144B",
+    "PSEN2")
+)
 
-dat2 <- prep_FindMarkers(dat, num_slices = 18)
-markers <- FindAllMarkers(dat2, only.pos = TRUE)
-
-#generate a list for significant markers for each list using log
-#Also orders the list from most to least significant
-marker_list <- markers %>%
-  filter(p_val_adj < 0.05) %>%
-  group_by(cluster) %>%
-  arrange(p_val_adj, desc(avg_log2FC)) %>%
-  summarise(genes = list(gene)) %>%
-  deframe()
-
-names(marker_list) <- as.character(names(marker_list))
+names(marker_list) <- gsub("^Cluster\\s+(\\d+):.*$", "\\1", names(marker_list))
 genes <- rownames(dat)
 
-# Create a mapping between numerical clusters and their celltype identities
+
+###############################################################################
+# SECTION 7: BUILD CLUSTER / SUBTYPE LOOKUPS                                  #
+###############################################################################
+
 cluster_mapping <- dat@meta.data %>%
-  group_by(seurat_clusters, celltype) %>%
-  tally() %>%
-  arrange(seurat_clusters, desc(n)) %>%
-  group_by(seurat_clusters) %>%
-  slice_head(n = 1) %>%
-  ungroup()
+  dplyr::group_by(seurat_clusters, celltype) %>%
+  dplyr::tally() %>%
+  dplyr::arrange(seurat_clusters, desc(n)) %>%
+  dplyr::group_by(seurat_clusters) %>%
+  dplyr::slice_head(n = 1) %>%
+  dplyr::ungroup()
 
-# Generate labels for dropdown menu
-cluster_options <- setNames(
-  as.character(cluster_mapping$seurat_clusters),
-  paste0("Cluster ", cluster_mapping$seurat_clusters, " (", cluster_mapping$celltype, ")")
-)
+clean_cluster_mapping <- cluster_mapping %>%
+  dplyr::select(seurat_clusters, celltype) %>%
+  dplyr::distinct()
 
-# Match the Main Cell types directly to cellsubtype values
+cluster_display_names <- paste0(clean_cluster_mapping$celltype,
+                                " (Cluster ", clean_cluster_mapping$seurat_clusters, ")")
+cluster_options <- setNames(as.character(clean_cluster_mapping$seurat_clusters),
+                            cluster_display_names)
+
 subtype_mapping <- dat@meta.data %>%
-  filter(!is.na(cellsubtype), !is.na(celltype)) %>%
-  distinct(celltype, cellsubtype) %>%
-  mutate(celltype = as.character(celltype), cellsubtype = as.character(cellsubtype)) %>%
-  filter(cellsubtype != celltype, !gregexpr("general", cellsubtype, ignore.case = TRUE) == 1)
-fov_names <- names(dat@images)
+  dplyr::filter(!is.na(cellsubtype), !is.na(celltype)) %>%
+  dplyr::distinct(celltype, cellsubtype) %>%
+  dplyr::mutate(celltype    = as.character(celltype),
+                cellsubtype = as.character(cellsubtype)) %>%
+  dplyr::filter(cellsubtype != celltype,
+                !grepl("general", cellsubtype, ignore.case = TRUE)) %>%
+  as.data.frame(row.names = NULL)
 
-### SPEED OPTIMIZATION STEP: PRE-COMPUTE GENE EXPRESSION STATS #################
-sct_data <- dat@assays$SCT@data
+# Cell types that actually have subtypes (for View 5 dropdown)
+celltypes_with_subtypes <- unique(subtype_mapping$celltype)
 
-#find maximum gene expression value for each gene, creates a vector based on the values
-gene_maxs <- setNames(rep(0, nrow(sct_data)), rownames(sct_data))
 
-#isolates the highest gene expression out of all the genes
-df_sparse <- as.data.frame(Matrix::summary(sct_data))
-max_nonzero <- df_sparse %>%
-  group_by(i) %>%
-  summarise(max_val = max(x), .groups = 'drop')
+###############################################################################
+# SECTION 8: LOAD PRECOMPUTED DATA & ENRICH WITH CELL IDS                    #
+#                                                                             #
+# spatial_data is a list of data.frames (one per FOV) with columns x, y,      #
+# celltype.  We add a cell_id column (cell barcode) and cellsubtype so that   #
+# gene-expression and subtype spatial plots can be built from the same        #
+# coordinate data without calling Seurat's fragile ImageDimPlot /             #
+# ImageFeaturePlot internals.                                                 #
+###############################################################################
 
-gene_maxs[max_nonzero$i] <- max_nonzero$max_val
+precomputed_data <- readRDS("/data/precomputed_app_data.rds")
+umap_data    <- precomputed_data$umap_data
+spatial_data <- precomputed_data$spatial_data
+ilae_lookup  <- precomputed_data$ilae_lookup
 
-#creates a table with gene names and the associated expressions
-#helps with determining what scale to set when displaying two
-#spatial plots side by side
-gene_max_df <- data.frame(
-  gene             = names(gene_maxs),
-  max_val          = gene_maxs,
-  stringsAsFactors = FALSE
-)
-rownames(gene_max_df) <- gene_max_df$gene
+# Enrich each FOV's data.frame with cell barcodes and subtype labels.
+# The rows in spatial_data[[fov]] are in the same order as the cells whose
+# orig.ident matches that FOV, since both were extracted from the same
+# Seurat object.
+for (.fov in names(spatial_data)) {
+  .cells <- colnames(dat)[dat$orig.ident == .fov]
+  .df    <- spatial_data[[.fov]]
+  if (nrow(.df) == length(.cells)) {
+    .df$cell_id      <- .cells
+    .df$cellsubtype  <- as.character(dat$cellsubtype_fine[.cells])
+    spatial_data[[.fov]] <- .df
+  }
+}
+rm(.fov, .cells, .df)
 
-#subsets the cells to 100000 cells if the actual number exceeds that
-#Helps ensure umpa processing and speed
-if (ncol(dat) > 100000) {
-  message("Subsampling background cells for performance...")
-  set.seed(42)
-  subsample_cells <- sample(colnames(dat), 100000)
-  dat_sub <<- subset(dat, cells = subsample_cells)
-} else {
-  dat_sub <<- dat
+
+###############################################################################
+# SECTION 9: PLOT HELPER FUNCTIONS                                           #
+#                                                                             #
+# Every helper returns a plain ggplot — never a patchwork — so they can be    #
+# freely combined with patchwork operators in the download handler.           #
+#                                                                             #
+# All plots use geom_scattermore for speed, with pixels = c(1024, 1024)       #
+# for sharp rasterization (the default resolution was what caused blurriness). #
+###############################################################################
+
+get_ilae_label <- function(fov) {
+  val <- ilae_lookup[fov]
+  if (is.null(val) || is.na(val)) "Unknown" else as.character(val)
 }
 
-##### GLOBAL HELPERS FOR IMAGE AND PLOTS #########################################
+# ── General UMAP (all cells colored by cell type) ──
+build_general_umap <- function() {
+  cols_umap <- colnames(umap_data)[1:2]
+  ggplot(umap_data, aes(.data[[cols_umap[1]]], .data[[cols_umap[2]]], color = celltype)) +
+    geom_scattermore(pointsize = 1, alpha = 0.8, pixels = c(1024, 1024)) +
+    scale_color_manual(values = pal_celltype) +
+    coord_fixed() + theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+    guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+}
 
-#helper function for text box used to display significantly expressed genes
-#formats the textbox in a coherent way that allows genes to be clearly displayed
-#when downloaded
-text_box_grob <- function(header_lines, marker_genes) {
-  max_vertical_lines <- 28
-  header_text <- paste(header_lines, collapse = "\n")
+# ── UMAP with one cell type highlighted ──
+build_highlighted_umap <- function(target_type, highlight_color = "#2c3e50") {
+  cols_umap <- colnames(umap_data)[1:2]
+  df <- umap_data
+  df$highlight <- ifelse(df$celltype == target_type, target_type, "other")
+  df <- df[order(df$highlight == target_type), ]
+  ggplot(df, aes(.data[[cols_umap[1]]], .data[[cols_umap[2]]], color = highlight)) +
+    geom_scattermore(pointsize = 1, alpha = 0.8, pixels = c(1024, 1024)) +
+    scale_color_manual(values = c("other" = "lightgrey",
+                                  setNames(highlight_color, target_type))) +
+    coord_fixed() + theme_classic() + theme(legend.position = "none")
+}
+
+# ── General spatial plot (one FOV, all cell types) ──
+build_general_spatial <- function(fov, dot_size = 1.5) {
+  df <- spatial_data[[fov]]
+  if (is.null(df))
+    return(ggplot() + theme_void() + ggtitle(paste0(fov, ": no data")))
+  ilae <- get_ilae_label(fov)
+  ggplot(df, aes(x = x, y = y, color = celltype)) +
+    geom_scattermore(pointsize = dot_size * 2, alpha = 0.7, pixels = c(1024, 1024)) +
+    scale_color_manual(values = pal_celltype) +
+    coord_fixed() + theme_void() +
+    theme(panel.background = element_rect(fill = "white", color = NA),
+          plot.background  = element_rect(fill = "white", color = NA),
+          legend.position  = "right") +
+    ggtitle(paste0(fov, " ILAE (", ilae, "): General"))
+}
+
+# ── Spatial plot with one cell type highlighted ──
+build_highlighted_spatial <- function(fov, target_type,
+                                      highlight_color = "firebrick1",
+                                      dot_size = 1.0) {
+  df <- spatial_data[[fov]]
+  if (is.null(df))
+    return(ggplot() + theme_void() + ggtitle(paste0(fov, ": no data")))
+  ilae <- get_ilae_label(fov)
+  df$highlight <- ifelse(df$celltype == target_type, target_type, "other")
+  df <- df[order(df$highlight == target_type), ]
+  ggplot(df, aes(x = x, y = y, color = highlight)) +
+    geom_scattermore(pointsize = dot_size * 2, pixels = c(1024, 1024)) +
+    scale_color_manual(values = c("other" = "lightgrey",
+                                  setNames(highlight_color, target_type))) +
+    coord_fixed() + theme_void() +
+    theme(legend.position = "none",
+          panel.background = element_rect(fill = "white", color = NA)) +
+    ggtitle(paste0(fov, " ILAE (", ilae, "): ", target_type))
+}
+
+# ── Spatial gene-expression plot (replaces ImageFeaturePlot_ordered) ──
+# Plots expression of one gene on one FOV using the enriched spatial_data,
+# with high-expressing cells drawn on top.
+build_gene_spatial <- function(fov, gene, dot_size = 1.0, max_expr = NULL) {
+  df <- spatial_data[[fov]]
+  if (is.null(df) || !"cell_id" %in% colnames(df))
+    return(ggplot() + theme_void() + ggtitle(paste0(fov, ": no data")))
   
+  expr_vec <- GetAssayData(dat, assay = "Xenium", layer = "data")[gene, df$cell_id]
+  df$expr  <- as.numeric(expr_vec)
+  df <- df[order(df$expr), ]                      # low first → high on top
+  
+  if (is.null(max_expr)) max_expr <- max(df$expr, na.rm = TRUE)
+  if (max_expr == 0) max_expr <- 1
+  ilae <- get_ilae_label(fov)
+  
+  ggplot(df, aes(x = x, y = y, color = expr)) +
+    geom_scattermore(pointsize = dot_size * 2, alpha = 0.7, pixels = c(1024, 1024)) +
+    scale_color_gradient(low = "lightgrey", high = "firebrick1",
+                         limits = c(0, max_expr),
+                         name = paste0(gene, "\nNormalized\nExpression")) +
+    coord_fixed() + theme_void() +
+    theme(panel.background = element_rect(fill = "white", color = NA),
+          plot.background  = element_rect(fill = "white", color = NA),
+          legend.position  = "right") +
+    ggtitle(paste0(fov, " ILAE (", ilae, "): ", gene))
+}
+
+# ── Spatial subtype-highlight plot (replaces ImageDimPlot_ordered) ──
+# Highlights one cellsubtype_fine value against a grey background.
+build_subtype_spatial <- function(fov, target_subtype,
+                                  highlight_color = "#c0392b",
+                                  dot_size = 1.0) {
+  df <- spatial_data[[fov]]
+  if (is.null(df) || !"cellsubtype" %in% colnames(df))
+    return(ggplot() + theme_void() + ggtitle(paste0(fov, ": no data")))
+  
+  ilae <- get_ilae_label(fov)
+  df$highlight <- ifelse(df$cellsubtype == target_subtype, target_subtype, "other")
+  if (!any(df$highlight == target_subtype))
+    return(ggplot() + theme_void() +
+             ggtitle(paste0("No '", target_subtype, "' cells in ", fov)))
+  df <- df[order(df$highlight == target_subtype), ]
+
+  ggplot(df, aes(x = x, y = y, color = highlight)) +
+    geom_scattermore(pointsize = dot_size * 2, pixels = c(1024, 1024)) +
+    scale_color_manual(values = c("other" = "lightgrey",
+                                  setNames(highlight_color, target_subtype))) +
+    coord_fixed() + theme_void() +
+    theme(legend.position = "none",
+          panel.background = element_rect(fill = "white", color = NA)) +
+    ggtitle(paste0(fov, " ILAE (", ilae, "): ", target_subtype))
+}
+
+
+###############################################################################
+# SECTION 10: TEXT BOX GROB FOR CLUSTER VIEW                                  #
+###############################################################################
+
+text_box_grob <- function(header_lines, marker_genes) {
+  header_text <- paste(header_lines, collapse = "\n")
   if (length(marker_genes) > 0) {
     genes_per_col <- 25
     gene_chunks <- split(marker_genes, ceiling(seq_along(marker_genes) / genes_per_col))
-    
-    max_len <- max(sapply(gene_chunks, length))
-    gene_chunks <- lapply(gene_chunks, function(x) {
-      c(x, rep("", max_len - length(x)))
-    })
-    
+    max_len     <- max(sapply(gene_chunks, length))
+    gene_chunks <- lapply(gene_chunks, function(x) c(x, rep("", max_len - length(x))))
     gene_matrix <- do.call(cbind, gene_chunks)
     gene_matrix <- apply(gene_matrix, 2, function(col) sprintf("%-10s", col))
     gene_lines  <- apply(gene_matrix, 1, paste, collapse = " ")
@@ -180,1204 +497,434 @@ text_box_grob <- function(header_lines, marker_genes) {
   } else {
     gene_text <- "  No statistically significant markers calculated."
   }
-  
   final_output <- paste(header_text, "\n", gene_text, sep = "\n")
-  
   ggplot() +
-    annotate("text", x = 0.05, y = 0.95, label = final_output, 
-             hjust = 0, vjust = 1, size = 3.5, family = "mono") + 
+    annotate("text", x = 0.05, y = 0.95, label = final_output,
+             hjust = 0, vjust = 1, size = 3.5, family = "mono") +
     theme_void() +
-    theme(
-      plot.margin      = margin(10, 10, 10, 10),
-      panel.background = element_rect(fill = "#fdfdfd", color = "grey80", linewidth = 0.5)
-    ) +
+    theme(plot.margin      = margin(10, 10, 10, 10),
+          panel.background = element_rect(fill = "#fdfdfd", color = "grey80",
+                                          linewidth = 0.5)) +
     coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE)
 }
 
-#Costume function for image dim plots
-ImageDimPlot_clean <- function(object, group.by, cols, fov = NULL, size = 1.2, border.size = NA) {
-  p <- Seurat::ImageDimPlot(
-    object = object, 
-    fov = fov, 
-    group.by = group.by, 
-    cols = cols, 
-    size = size, 
-    border.size = border.size
-  )
-  p + coord_fixed() + theme_void() + 
-    theme(
-      panel.background = element_rect(fill = "white", color = NA),
-      plot.background  = element_rect(fill = "white", color = NA),
-      legend.position  = "right"
-    )
-}
 
-#labels all "P" ILAE scores into "Postmortem"
-dat@meta.data$ILAE_score[dat@meta.data$ILAE_score == "P"] <- "postmortem/control"
+###############################################################################
+#                              USER INTERFACE                                 #
+###############################################################################
 
-#Downloading colour palette used for Larissa's study
-read_named_palette <- function(csv_path) {
-  pal <- read.csv(csv_path, stringsAsFactors = FALSE)
-  setNames(pal$x, pal$X)
-}
-
-pal_celltype <- read_named_palette(file.path(cfg$pal_dir, "pal_celltype.csv"))
-
-### ADVANCED OPTIMIZATION: PRECOMPUTE SPATIAL & UMAP PLOTS #####################
-precomputed_general_plots <- list()
-
-#Precompute general UMAP
-precomputed_general_umap <- DimPlot(
-  dat_sub, 
-  reduction = "umap", 
-  group.by = "celltype", 
-  cols = pal_celltype
-) + 
-  coord_fixed() + 
-  theme_minimal() + 
-  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
-
-#Precompute all general spatial plots
-for (fov in fov_names) {
-  df_sub <- dat@meta.data[dat@meta.data$orig.ident == fov, ]
-  ilae_val <- if(nrow(df_sub) > 0) unique(df_sub$ILAE_score)[1] else "Unknown"
-  if (is.na(ilae_val)) ilae_val <- "Unknown"
-  
-  precomputed_general_plots[[fov]] <- ImageDimPlot_clean(
-    dat, fov = fov, group.by = "celltype", cols = pal_celltype, size = 1.0, border.size = NA
-  ) + ggtitle(paste0(fov, " ILAE (", ilae_val, "): General"))
-}
-
-precomputed_main_umaps <- list()
-all_main_types <- levels(dat_sub$celltype)
-
-#Precompute UMAP for all celltypes
-for (m_type in all_main_types) {
-  custom_colors <- setNames(rep("lightgrey", length(all_main_types)), all_main_types)
-  custom_colors[m_type] <- "#2c3e50"
-  
-  precomputed_main_umaps[[m_type]] <- DimPlot(
-    dat_sub, reduction = "umap", group.by = "celltype", cols = custom_colors
-  ) + coord_fixed() + theme_minimal() + theme(legend.position = "none")
-}
-
-precomputed_sub_umaps <- list()
-all_sub_types <- unique(as.character(dat_sub$cellsubtype[!is.na(dat_sub$cellsubtype)]))
-
-#Precompute feature UMAPS for all cell subtypes
-for (s_type in all_sub_types) {
-  custom_colors <- setNames(rep("lightgrey", length(all_sub_types)), all_sub_types)
-  custom_colors[s_type] <- "#c0392b"
-  
-  precomputed_sub_umaps[[s_type]] <- DimPlot(
-    dat_sub, reduction = "umap", group.by = "cellsubtype", cols = custom_colors
-  ) + coord_fixed() + theme_minimal() + theme(legend.position = "none")
-}
-
-
-### ImageFeaturePlot but with an option to plot low expressing cells first, high expressing cells on top
-# This works only if blend=false and if you're plotting only one feature
-# LK 2025-11-24, but really ChatGPT made it from Seurat v5 ImageFeaturePlot() 
-# Important to not just define function but also it's environment below!
-#NOTE: this funtion was written by Larissa
-#To allow the high-expression cells to be displayed on top 
-#For the spatial plots
-
-ImageFeaturePlot_ordered <- function(
-    object,
-    features,
-    fov = NULL,
-    boundaries = NULL,
-    cols = if (isTRUE(x = blend)) {
-      c("lightgrey", "#ff0000", "#00ff00")
-    } else {
-      c("lightgrey", "firebrick1")
-    },
-    size = 0.5,
-    min.cutoff = NA,
-    max.cutoff = NA,
-    split.by = NULL,
-    molecules = NULL,
-    mols.size = 0.1,
-    mols.cols = NULL,
-    nmols = 1000,
-    alpha = 1,
-    border.color = "white",
-    border.size = NULL,
-    dark.background = TRUE,
-    blend = FALSE,
-    blend.threshold = 0.5,
-    crop = FALSE,
-    cells = NULL,
-    scale = c("feature", "all", "none"),
-    overlap = FALSE,
-    axes = FALSE,
-    combine = TRUE,
-    coord.fixed = TRUE,
-    order = FALSE   # NEW ARGUMENT
-) {
-  cells <- cells %||% Cells(x = object)
-  scale <- scale[[1L]]
-  scale <- match.arg(arg = scale)
-  no.right <- theme(
-    axis.line.y.right = element_blank(),
-    axis.ticks.y.right = element_blank(),
-    axis.text.y.right = element_blank(),
-    axis.title.y.right = element_text(
-      face = "bold",
-      size = 14,
-      margin = margin(r = 7)
-    )
-  )
-  fov <- fov %||% DefaultFOV(object = object)
-  fov <- Filter(
-    f = function(x) {
-      return(x %in% Images(object = object) && inherits(x = object[[x]], what = "FOV"))
-    },
-    x = fov
-  )
-  if (!length(x = fov)) {
-    stop("No compatible spatial coordinates present")
-  }
-  boundaries <- boundaries %||% sapply(
-    X = fov,
-    FUN = function(x) {
-      return(DefaultBoundary(object = object[[x]]))
-    },
-    simplify = FALSE,
-    USE.NAMES = TRUE
-  )
-  boundaries <- .BoundariesByImage(object = object, fov = fov, boundaries = boundaries)
-  fov <- names(x = boundaries)
-  if (isTRUE(x = blend) || !is.null(x = split.by)) {
-    type <- ifelse(test = isTRUE(x = "blend"), yes = "Blended", no = "Split")
-    if (length(x = fov) != 1L) {
-      fov <- fov[1L]
-      warning(
-        type,
-        " image feature plots can only be done on a single image, using \"",
-        fov, "\"",
-        call. = FALSE,
-        immediate. = TRUE
-      )
-    }
-    if (any(!overlap) && length(x = boundaries[[fov]]) > 1L) {
-      warning(
-        type,
-        " image feature plots require overlapped segmentations",
-        call. = FALSE,
-        immediate. = TRUE
-      )
-    }
-    overlap <- TRUE
-  }
-  overlap <- rep_len(x = overlap, length.out = length(x = fov))
-  crop <- rep_len(x = crop, length.out = length(x = fov))
-  names(x = crop) <- names(x = overlap) <- fov
-  if (isTRUE(x = blend)) {
-    if (length(x = features) != 2L) {
-      stop("Blended feature plots only works with two features")
-    }
-    # simpler than the original formals() trick
-    default.colors <- c("lightgrey", "#ff0000", "#00ff00")
-    cols <- switch(
-      EXPR = as.character(x = length(x = cols)),
-      `0` = {
-        warning("No colors provided, using default colors", immediate. = TRUE)
-        default.colors
-      },
-      `1` = {
-        warning(
-          "Only one color provided, assuming specified is double-negative and augmenting with default colors",
-          immediate. = TRUE
-        )
-        c(cols, default.colors[2:3])
-      },
-      `2` = {
-        warning(
-          "Only two colors provided, assuming specified are for features and augmenting with '",
-          default.colors[1], "' for double-negatives",
-          immediate. = TRUE
-        )
-        c(default.colors[1], cols)
-      },
-      `3` = cols,
-      {
-        warning("More than three colors provided, using only first three", immediate. = TRUE)
-        cols[1:3]
-      }
-    )
-  }
-  md <- FetchData(object = object, vars = c(features, split.by[1L]), cells = cells)
-  split.by <- intersect(x = split.by, y = colnames(x = md))
-  if (!length(x = split.by)) {
-    split.by <- NULL
-  }
-  imax <- ifelse(
-    test = is.null(x = split.by),
-    yes = ncol(x = md),
-    no = ncol(x = md) - length(x = split.by)
-  )
-  features <- colnames(x = md)[1:imax]
-  min.cutoff <- mapply(
-    FUN = function(cutoff, feature) {
-      return(ifelse(
-        test = is.na(x = cutoff),
-        yes  = min(md[[feature]]),
-        no   = cutoff
-      ))
-    },
-    cutoff = min.cutoff,
-    feature = features
-  )
-  max.cutoff <- mapply(
-    FUN = function(cutoff, feature) {
-      return(ifelse(
-        test = is.na(x = cutoff),
-        yes  = max(md[[feature]]),
-        no   = cutoff
-      ))
-    },
-    cutoff = max.cutoff,
-    feature = features
-  )
-  check.lengths <- unique(x = vapply(
-    X = list(features, min.cutoff, max.cutoff),
-    FUN = length,
-    FUN.VALUE = numeric(length = 1)
-  ))
-  if (length(x = check.lengths) != 1) {
-    stop("There must be the same number of minimum and maximum cuttoffs as there are features")
-  }
-  brewer.gran <- ifelse(
-    test = length(x = cols) == 1,
-    yes  = brewer.pal.info[cols, ]$maxcolors,
-    no   = length(x = cols)
-  )
-  for (i in seq_along(along.with = features)) {
-    f <- features[[i]]
-    data.feature <- md[[f]]
-    min.use <- SetQuantile(cutoff = min.cutoff[i], data = data.feature)
-    max.use <- SetQuantile(cutoff = max.cutoff[i], data = data.feature)
-    data.feature[data.feature < min.use] <- min.use
-    data.feature[data.feature > max.use] <- max.use
-    if (brewer.gran != 2) {
-      data.feature <- if (all(data.feature == 0)) {
-        rep_len(x = 0, length.out = length(x = data.feature))
-      } else {
-        as.numeric(x = as.factor(x = cut(
-          x = as.numeric(x = data.feature),
-          breaks = brewer.gran
-        )))
-      }
-    }
-    md[[f]] <- data.feature
-  }
-  if (is.null(x = split.by)) {
-    split.by <- RandomName()
-    md[[split.by]] <- factor(x = split.by)
-  }
-  if (!is.factor(x = md[[split.by]])) {
-    md[[split.by]] <- factor(x = md[[split.by]])
-  }
-  if (isTRUE(x = blend)) {
-    md <- lapply(
-      X = levels(x = md[[split.by]]),
-      FUN = function(x) {
-        df <- md[as.character(x = md[[split.by]]) == x, , drop = FALSE]
-        no.expression <- features[colMeans(x = df[, features]) == 0]
-        if (length(x = no.expression)) {
-          stop(
-            "The following features have no value: ",
-            paste(no.expression, collapse = ", ")
-          )
-        }
-        return(cbind(
-          df[, split.by, drop = FALSE],
-          BlendExpression(data = df[, features])
-        ))
-      }
-    )
-    md <- do.call(what = "rbind", args = md)
-    features <- setdiff(x = colnames(x = md), y = split.by)
-  }
-  pnames <- unlist(x = lapply(
-    X = seq_along(along.with = fov),
-    FUN = function(i) {
-      return(if (isTRUE(x = overlap[i])) {
-        fov[i]
-      } else {
-        paste(fov[i], boundaries[[i]], sep = "_")
-      })
-    }
-  ))
-  pdata <- vector(mode = "list", length = length(x = pnames))
-  names(x = pdata) <- pnames
-  for (i in names(x = pdata)) {
-    ul <- unlist(x = strsplit(x = i, split = "_"))
-    if (length(ul) > 1) {
-      img <- paste(ul[1:length(ul) - 1], collapse = "_")
-      lyr <- ul[length(ul)]
-    } else if (length(ul) == 1) {
-      img <- ul[1]
-      lyr <- "centroids"
-    } else {
-      stop("the length of ul is 0. please check.")
-    }
-    if (is.na(x = lyr)) {
-      lyr <- boundaries[[img]]
-    }
-    pdata[[i]] <- lapply(
-      X = lyr,
-      FUN = function(l) {
-        df <- fortify(model = object[[img]][[l]])
-        df <- df[df$cell %in% cells, , drop = FALSE]
-        if (!is.null(x = md)) {
-          df <- merge(x = df, y = md, by.x = "cell", by.y = 0, all.x = TRUE)
-        }
-        df$cell <- paste(l, df$cell, sep = "_")
-        df$boundary <- l
-        return(df)
-      }
-    )
-    pdata[[i]] <- if (!is_na(x = pdata[[i]])) {
-      do.call(what = "rbind", args = pdata[[i]])
-    } else {
-      unlist(x = pdata[[i]])
-    }
-  }
-  if (!is.null(x = molecules)) {
-    molecules <- .MolsByFOV(object = object, fov = fov, molecules = molecules)
-    mdata <- vector(mode = "list", length = length(x = fov))
-    names(x = mdata) <- fov
-    for (img in names(x = mdata)) {
-      idata <- object[[img]]
-      if (!img %in% names(x = molecules)) {
-        mdata[[img]] <- NULL
-        next
-      }
-      if (isTRUE(x = crop[img])) {
-        idata <- Overlay(x = idata, y = idata)
-      }
-      imols <- gsub(
-        pattern = paste0("^", Key(object = idata)),
-        replacement = "",
-        x = molecules[[img]]
-      )
-      mdata[[img]] <- FetchData(object = idata, vars = imols, nmols = nmols)
-    }
-  } else {
-    mdata <- NULL
-  }
-  if (isTRUE(x = blend)) {
-    ncol <- 4
-    color.matrix <- BlendMatrix(
-      two.colors = cols[2:3],
-      col.threshold = blend.threshold,
-      negative.color = cols[1]
-    )
-    cols <- cols[2:3]
-    colors <- list(
-      color.matrix[, 1],
-      color.matrix[1, ],
-      as.vector(x = color.matrix)
-    )
-    blend.legend <- BlendMap(color.matrix = color.matrix)
-  }
-  limits <- switch(
-    EXPR = scale,
-    all  = range(unlist(x = md[, features])),
-    NULL
-  )
-  plots <- vector(
-    mode = "list",
-    length = length(x = levels(x = md[[split.by]]))
-  )
-  names(x = plots) <- levels(x = md[[split.by]])
-  for (i in seq_along(along.with = levels(x = md[[split.by]]))) {
-    ident <- levels(x = md[[split.by]])[i]
-    plots[[ident]] <- vector(mode = "list", length = length(x = pdata))
-    names(x = plots[[ident]]) <- names(x = pdata)
-    if (isTRUE(x = blend)) {
-      blend.key <- suppressMessages(
-        expr = blend.legend +
-          scale_y_continuous(
-            sec.axis = dup_axis(
-              name = ifelse(
-                test = length(x = levels(x = md[[split.by]])) > 1,
-                yes  = ident,
-                no   = ""
-              )
-            ),
-            expand = c(0, 0)
-          ) +
-          labs(
-            x = features[1L],
-            y = features[2L],
-            title = if (i == 1L) {
-              paste("Color threshold:", blend.threshold)
-            } else {
-              NULL
-            }
-          ) +
-          no.right
-      )
-    }
-    for (j in seq_along(along.with = pdata)) {
-      key <- names(x = pdata)[j]
-      img <- unlist(x = strsplit(x = key, split = "_"))[1L]
-      plots[[ident]][[key]] <- vector(
-        mode = "list",
-        length = length(x = features) + ifelse(
-          test = isTRUE(x = blend),
-          yes  = 1L,
-          no   = 0L
-        )
-      )
-      data.plot <- pdata[[j]][
-        as.character(x = pdata[[j]][[split.by]]) == ident,
-        ,
-        drop = FALSE
-      ]
-      for (y in seq_along(along.with = features)) {
-        feature <- features[y]
-        
-        ## NEW: reorder so high expression is drawn last (on top)
-        if (isTRUE(order) && feature %in% colnames(data.plot)) {
-          data.plot <- data.plot[order(data.plot[[feature]]), , drop = FALSE]
-        }
-        
-        cols.use <- if (isTRUE(x = blend)) {
-          cc <- as.numeric(x = as.character(x = data.plot[, feature])) + 1
-          colors[[y]][sort(unique(x = cc))]
-        } else {
-          NULL
-        }
-        colnames(data.plot) <- gsub("-", "_", colnames(data.plot))
-        p <- SingleImagePlot(
-          data = data.plot,
-          col.by = gsub("-", "_", feature),
-          size = size,
-          col.factor = blend,
-          cols = cols.use,
-          molecules = mdata[[img]],
-          mols.size = mols.size,
-          mols.cols = mols.cols,
-          alpha = alpha,
-          border.color = border.color,
-          border.size = border.size,
-          dark.background = dark.background
-        ) +
-          CenterTitle() +
-          labs(fill = feature)
-        if (isTRUE(x = blend)) {
-          p <- p + guides(fill = "none")
-        }
-        if (isTRUE(coord.fixed)) {
-          p <- p + coord_fixed()
-        }
-        if (!isTRUE(x = axes)) {
-          p <- p + NoAxes(panel.background = element_blank())
-        } else if (isTRUE(x = blend) || length(x = levels(x = md[[split.by]])) > 1L) {
-          if (y != 1L) {
-            p <- p + theme(
-              axis.line.y = element_blank(),
-              axis.ticks.y = element_blank(),
-              axis.text.y = element_blank(),
-              axis.title.y.left = element_blank()
-            )
-          }
-          if (i != length(x = levels(x = md[[split.by]]))) {
-            p <- p + theme(
-              axis.line.x = element_blank(),
-              axis.ticks.x = element_blank(),
-              axis.text.x = element_blank(),
-              axis.title.x = element_blank()
-            )
-          }
-        }
-        if (!isTRUE(x = blend)) {
-          if (length(x = cols) == 1L) {
-            p <- p + scale_fill_brewer(palette = cols)
-          } else {
-            cols.grad <- cols
-            fexp <- data.plot[data.plot[[split.by]] == ident, feature, drop = TRUE]
-            fexp <- unique(x = fexp)
-            if (length(x = fexp) == 1L) {
-              warning(
-                "All cells have the same value (",
-                fexp,
-                ") of ",
-                feature,
-                call. = FALSE,
-                immediate. = TRUE
-              )
-              if (fexp == 0) {
-                cols.grad <- cols.grad[1L]
-              }
-            }
-            if (scale == "feature") {
-              limits <- range(pdata[[j]][[feature]])
-            }
-            p <- p + ggplot2::scale_fill_gradientn(
-              colors = cols.grad,
-              guide = "colorbar",
-              limits = limits
-            )
-          }
-        }
-        p <- p + if (i == 1L) {
-          ggplot2::labs(title = feature)
-        } else {
-          ggplot2::labs(title = NULL)
-        }
-        plots[[ident]][[key]][[y]] <- p
-      }
-      if (isTRUE(x = blend)) {
-        plots[[ident]][[key]][[length(x = plots[[ident]][[key]])]] <- blend.key
-      } else if (length(x = levels(x = md[[split.by]])) > 1L) {
-        plots[[ident]][[key]][[y]] <- suppressMessages(
-          expr = plots[[ident]][[key]][[y]] +
-            scale_y_continuous(sec.axis = dup_axis(name = ident)) +
-            no.right
-        )
-      }
-    }
-    plots[[ident]] <- unlist(x = plots[[ident]], recursive = FALSE, use.names = FALSE)
-  }
-  plots <- unlist(x = plots, recursive = FALSE, use.names = FALSE)
-  if (isTRUE(x = combine)) {
-    if (isTRUE(x = blend) || length(x = levels(x = md[[split.by]])) > 1L) {
-      plots <- wrap_plots(
-        plots,
-        ncol = ifelse(test = isTRUE(x = blend), yes = 4L, no = length(x = features)),
-        nrow = length(x = levels(x = md[[split.by]])),
-        guides = "collect"
-      )
-    } else {
-      plots <- wrap_plots(plots)
-    }
-  }
-  return(plots)
-}
-
-# Locking down the environment for internal Seurat calls
-environment(ImageFeaturePlot_ordered) <- environment(Seurat::ImageFeaturePlot)
-
-
-########     2) UI   ###########################################################
 ui <- fluidPage(
   titlePanel("TLEseq"),
-  
-  #Text layout at the top of the website
-  p(style = "margin-top: -10px; margin-bottom: 15px; color: #555555; font-size: 14px;",
+  p(style = "margin-top:-10px; margin-bottom:15px; color:#555; font-size:14px;",
     "Data source and methodology adapted from ",
-    tags$em("Author et al., 2026."), 
-    " Read the full study here: ",
-    tags$a(href = "https://doi.org/your-paper-link-here", 
-           target = "_blank", 
-           "Nature Neuroscience (2026)"),
-    textOutput("ram_usage")
-  ),
+    tags$em("Kraus et al., 2026."), " Read the full study here: ",
+    tags$a(href = "https://doi.org/your-paper-link-here",
+           target = "_blank", "Nature Neuroscience (2026)")),
   
-  #Main selection panel for users to chose what type of plot they want
   sidebarLayout(
     sidebarPanel(
       selectInput("view_type", "View Type:",
-                  choices = c("UMAP + Violin Plot", 
+                  choices = c("UMAP + Violin Plot",
                               "UMAP Cluster Selection",
-                              "Spatial Feature Plot (Gene Expression)", 
+                              "Spatial Feature Plot (Gene Expression)",
                               "Spatial Feature Plot (Cell Type)",
-                              "Cell Type & Subtype Exploration"
-                  )),
+                              "Cell Type & Subtype Exploration")),
       
-      #UMAP + violin plot
-      #This coice automatically plots two general UMAPS
-      #Users can select two specific genes to examine, which will allow 
-      #a UMAP feature plot and a corresponding violin plot to pop up
+      conditionalPanel("input.view_type == 'UMAP + Violin Plot'",
+                       selectInput("gene_umap1", "Gene 1:",
+                                   choices = c("General", genes), selected = "General"),
+                       selectInput("gene_umap2", "Gene 2 (optional):",
+                                   choices = c("General", genes), selected = "General")),
+      
+      conditionalPanel("input.view_type == 'UMAP Cluster Selection'",
+                       selectInput("selected_cluster_drop",
+                                   "Select Cluster Identity:", choices = cluster_options)),
+      
+      conditionalPanel("input.view_type == 'Spatial Feature Plot (Gene Expression)'",
+                       selectInput("fov1", "FOV 1:", choices = fov_names),
+                       selectInput("gene_spatial1", "Gene 1:",
+                                   choices = c("General", genes), selected = "General"),
+                       selectInput("fov2", "FOV 2:", choices = fov_names),
+                       selectInput("gene_spatial2", "Gene 2:",
+                                   choices = c("General", genes), selected = "General")),
+      
+      conditionalPanel("input.view_type == 'Spatial Feature Plot (Cell Type)'",
+                       selectInput("fov_ct1", "FOV 1:", choices = fov_names),
+                       selectInput("celltype_select1", "Cell Identity 1:",
+                                   choices = c("General", levels(dat$celltype)),
+                                   selected = "General"),
+                       selectInput("fov_ct2", "FOV 2:", choices = fov_names),
+                       selectInput("celltype_select2", "Cell Identity 2:",
+                                   choices = c("General", levels(dat$celltype)),
+                                   selected = "General")),
+      
+      conditionalPanel("input.view_type == 'Cell Type & Subtype Exploration'",
+                       selectInput("sub_explore_fov", "Select FOV:", choices = fov_names),
+                       selectInput("sub_explore_main_type", "Select Main Cell Type:",
+                                   choices = celltypes_with_subtypes),
+                       uiOutput("dynamic_subtype_ui")),
+      
+      hr(),
       conditionalPanel(
-        condition = "input.view_type == 'UMAP + Violin Plot'",
-        selectInput("gene_umap1", "Gene 1:", choices = c("General", rownames(dat)), selected = "General"),
-        selectInput("gene_umap2", "Gene 2 (optional):", choices = c("General", rownames(dat)), selected = "General")
-      ),
+        condition = paste0(
+          "input.view_type == 'Spatial Feature Plot (Gene Expression)' || ",
+          "input.view_type == 'Spatial Feature Plot (Cell Type)' || ",
+          "input.view_type == 'Cell Type & Subtype Exploration'"),
+        sliderInput("spatial_dot_size", "Spatial Dot Size:",
+                    min = 0.5, max = 4, value = 1.0, step = 0.1)),
       
-      #UMAP Cluster identity + significantly expressed genes
-      #A general UMAP will be shown, with the cell identities labelled
-      #Users can select a cell type to examine, which causes
-      #A text box to show up containing all the significantly expressed genes
-      #For that celltype
-      conditionalPanel(
-        condition = "input.view_type == 'UMAP Cluster Selection'",
-        selectInput("selected_cluster_drop", "Select Cluster Identity:", choices = cluster_options)
-      ),
-      
-      #Spatial feature plot
-      #Two general spatial plots will pop up automatically
-      #Users can select two genes to get the spatial feature plots for
-      conditionalPanel(
-        condition = "input.view_type == 'Spatial Feature Plot (Gene Expression)'",
-        selectInput("fov1", "FOV 1:", choices = fov_names),
-        selectInput("gene_spatial1", "Gene 1:", choices = c("General", genes), selected = "General"),
-        selectInput("fov2", "FOV 2:", choices = fov_names),
-        selectInput("gene_spatial2", "Gene 2:", choices = c("General", genes), selected = "General")
-      ),
-      
-      #Spatial feature plot
-      #Two general spatial plots will pop up automatically
-      #Users can select two cell types to get the spatial feature plots for
-      conditionalPanel(
-        condition = "input.view_type == 'Spatial Feature Plot (Cell Type)'",
-        selectInput("fov_ct1", "FOV 1:", choices = fov_names),
-        selectInput("celltype_select1", "Cell Identity 1:", choices = c("General", levels(dat$celltype)), selected = "General"),
-        selectInput("fov_ct2", "FOV 2:", choices = fov_names),
-        selectInput("celltype_select2", "Cell Identity 2:", choices = c("General", levels(dat$celltype)), selected = "General")
-      ),
-      
-      #Cell type and subtype UMAP + spatial plot
-      #Users can select a general cell type, which generates the UMAP and 
-      #Spatial feature plot for that cell type
-      #Users can then select a subtype from the selected cell type
-      #Which generates a second set of UMAP and spatial feature plots
-      conditionalPanel(
-        condition = "input.view_type == 'Cell Type & Subtype Exploration'",
-        selectInput("sub_explore_fov", "Select FOV:", choices = fov_names),
-        selectInput("sub_explore_main_type", "Select Main Cell Type:", choices = levels(dat$celltype)),
-        uiOutput("dynamic_subtype_ui") 
-      ),
-      
-      hr(), 
-      
-      #For all spatial feature plots, a slider is provided so that the 
-      #user can adjust the dot size of the plots for an easier visualization
-      conditionalPanel(
-        condition = "input.view_type == 'Spatial Feature Plot (Gene Expression)' || \
-                     input.view_type == 'Spatial Feature Plot (Cell Type)' || \
-                     input.view_type == 'Cell Type & Subtype Exploration'",
-        sliderInput("spatial_dot_size", "Spatial Dot Size:", min = 0.5, max = 4, value = 1.2, step = 0.1)
-      ),
-      
-      #All plots and textboxes generated can be downloaded as a PDF
       downloadButton("download_plot", "Download Current View (PDF)")
     ),
     
-    #Layout for UMAP + violin plot
     mainPanel(
-      conditionalPanel(
-        condition = "input.view_type == 'UMAP + Violin Plot'",
-        fluidRow(
-          column(6, plotOutput("plot", height = "500px"), 
-                 plotOutput("violinplot1", height = "300px")),
-          column(6, plotOutput("plot2", height = "500px"), 
-                 plotOutput("violinplot2", height = "300px"))
-        )
-      ),
+      conditionalPanel("input.view_type == 'UMAP + Violin Plot'",
+                       fluidRow(
+                         column(6, plotOutput("plot",       height = "500px"),
+                                plotOutput("violinplot1", height = "300px")),
+                         column(6, plotOutput("plot2",      height = "500px"),
+                                plotOutput("violinplot2", height = "300px")))),
       
-      #Layout for UMAP and textbox
-      conditionalPanel(
-        condition = "input.view_type == 'UMAP Cluster Selection'",
-        fluidRow(
-          column(8, plotOutput("cluster_select_plot", height = "600px")),
-          column(4, 
-                 h4("Cluster Analysis"),
-                 br(),
-                 verbatimTextOutput("cluster_info_box"))
-        )
-      ),
+      conditionalPanel("input.view_type == 'UMAP Cluster Selection'",
+                       fluidRow(
+                         column(8, plotOutput("cluster_select_plot", height = "600px")),
+                         column(4, h4("Cluster Analysis"), br(),
+                                verbatimTextOutput("cluster_info_box")))),
       
-      #Layout for spatial feature plots (gene expression)
-      conditionalPanel(
-        condition = "input.view_type == 'Spatial Feature Plot (Gene Expression)'",
-        fluidRow(
-          column(6, plotOutput("spatial_plot1", height = "600px")), 
-          column(6, plotOutput("spatial_plot2", height = "600px"))
-        )
-      ),
+      conditionalPanel("input.view_type == 'Spatial Feature Plot (Gene Expression)'",
+                       fluidRow(
+                         column(6, plotOutput("spatial_plot1", height = "600px")),
+                         column(6, plotOutput("spatial_plot2", height = "600px")))),
       
-      #Layout for spatial feature plots (cell type)
-      conditionalPanel(
-        condition = "input.view_type == 'Spatial Feature Plot (Cell Type)'",
-        fluidRow(
-          column(6, plotOutput("spatial_ct_plot1", height = "600px")), 
-          column(6, plotOutput("spatial_ct_plot2", height = "600px"))
-        )
-      ),
+      conditionalPanel("input.view_type == 'Spatial Feature Plot (Cell Type)'",
+                       fluidRow(
+                         column(6, plotOutput("spatial_ct_plot1", height = "600px")),
+                         column(6, plotOutput("spatial_ct_plot2", height = "600px")))),
       
-      #Layout for cell type and subtype UMAPS + Spatial plots
-      conditionalPanel(
-        condition = "input.view_type == 'Cell Type & Subtype Exploration'",
-        fluidRow(
-          column(6, h4("Main Cell Type Projections", style = "font-weight:bold; color:#2c3e50;"),
-                 plotOutput("sub_explore_main_umap", height = "400px"),
-                 plotOutput("sub_explore_main_spatial", height = "400px")),
-          column(6, h4("Subtype Metadata Projections", style = "font-weight:bold; color:#c0392b;"),
-                 plotOutput("sub_explore_sub_umap", height = "400px"),
-                 plotOutput("sub_explore_sub_spatial", height = "400px"))
-        )
-      )
+      conditionalPanel("input.view_type == 'Cell Type & Subtype Exploration'",
+                       fluidRow(
+                         column(6,
+                                h4("Main Cell Type Highlight",
+                                   style = "font-weight:bold; color:#2c3e50;"),
+                                plotOutput("sub_explore_main_umap",    height = "400px"),
+                                plotOutput("sub_explore_main_spatial", height = "400px")),
+                         column(6,
+                                h4("Cell Subtype Highlight",
+                                   style = "font-weight:bold; color:#c0392b;"),
+                                plotOutput("sub_explore_sub_umap",    height = "400px"),
+                                plotOutput("sub_explore_sub_spatial", height = "400px"))))
     )
   )
 )
 
-### DOWNLOADING INFRASTRUCTURE #################################################
-#This allows all of the possible plots and text boxes generated to be downloaded
-#It helps lay out the format of the plots onto a page so that all plots
-#Can be clearly displayed
-# Master plotting / retrieval function for Shiny UI & Download Handler
+
+###############################################################################
+# DOWNLOAD INFRASTRUCTURE                                                    #
+#                                                                             #
+# make_current_plot() returns a single ggplot or patchwork for every view.    #
+# All spatial helpers now return plain ggplots, so patchwork combining works.  #
+###############################################################################
+
 make_current_plot <- function(input) {
   
+  # ---------- VIEW 1: UMAP + Violin Plot ----------
   if (input$view_type == "UMAP + Violin Plot") {
-    u1 <- if (input$gene_umap1 == "General") {
-      precomputed_general_umap + ggtitle("General UMAP")
-    } else {
-      FeaturePlot(dat_sub, features = input$gene_umap1, reduction = "umap") + coord_fixed()
-    }
     
+    u1 <- if (input$gene_umap1 == "General") {
+      build_general_umap() + ggtitle("General UMAP")
+    } else {
+      FeaturePlot(dat, features = input$gene_umap1, reduction = "umap") +
+        coord_fixed() + labs(color = "Normalized\nExpression")
+    }
     b1 <- if (input$gene_umap1 == "General") {
       ggplot() + theme_void()
     } else {
-      df1 <- FetchData(dat_sub, vars = c(input$gene_umap1, "celltype"))
+      df1 <- FetchData(dat, vars = c(input$gene_umap1, "celltype"))
       colnames(df1)[1] <- "expr"
       ggplot(df1, aes(x = celltype, y = expr, fill = celltype)) +
-        geom_violin(scale = "width", alpha = 0.85, width = 0.6) + 
-        scale_fill_manual(values = pal_celltype) +
-        theme_classic() + ylab(paste(input$gene_umap1, "Expression"))
+        geom_violin(scale = "width", alpha = 0.85, width = 0.6) +
+        scale_fill_manual(values = pal_celltype) + theme_classic() +
+        ylab(paste(input$gene_umap1, "Expression"))
     }
-    
     u2 <- if (input$gene_umap2 == "General") {
-      precomputed_general_umap + ggtitle("General UMAP")
+      build_general_umap() + ggtitle("General UMAP")
     } else {
-      FeaturePlot(dat_sub, features = input$gene_umap2, reduction = "umap") + coord_fixed()
+      FeaturePlot(dat, features = input$gene_umap2, reduction = "umap") +
+        coord_fixed() + labs(color = "Normalized\nExpression")
     }
-    
-    b2 <- if (input$gene_umap2 == "General" || !input$gene_umap2 %in% rownames(dat_sub)) {
+    b2 <- if (input$gene_umap2 == "General" || !input$gene_umap2 %in% rownames(dat)) {
       ggplot() + theme_void()
     } else {
-      df2 <- FetchData(dat_sub, vars = c(input$gene_umap2, "celltype"))
+      df2 <- FetchData(dat, vars = c(input$gene_umap2, "celltype"))
       colnames(df2)[1] <- "expr"
       ggplot(df2, aes(x = celltype, y = expr, fill = celltype)) +
-        geom_violin(scale = "width", alpha = 0.85, width = 0.6) + 
-        scale_fill_manual(values = pal_celltype) +
-        theme_classic() + ylab(paste(input$gene_umap2, "Expression"))
+        geom_violin(scale = "width", alpha = 0.85, width = 0.6) +
+        scale_fill_manual(values = pal_celltype) + theme_classic() +
+        ylab(paste(input$gene_umap2, "Expression"))
     }
+    left  <- wrap_plots(u1, b1, ncol = 1, heights = c(5, 3))
+    right <- wrap_plots(u2, b2, ncol = 1, heights = c(5, 3))
+    return(wrap_plots(left, right, ncol = 2))
     
-    return((u1 / b1) | (u2 / b2)) + plot_layout(heights = c(5, 3))
-  } 
-  
-  else if (input$view_type == "UMAP Cluster Selection") {
-    u_plot <- DimPlot(dat_sub, reduction = "umap", group.by = "celltype", cols = pal_celltype) + 
-      coord_fixed() + ggtitle("General UMAP Layout")
+    # ---------- VIEW 2: UMAP Cluster Selection ----------
+  } else if (input$view_type == "UMAP Cluster Selection") {
     
+    u_plot     <- build_general_umap() + ggtitle("General UMAP Layout")
     cluster_id <- input$selected_cluster_drop
-    mapped_type <- cluster_mapping %>% 
-      filter(seurat_clusters == cluster_id) %>% 
-      pull(celltype)
+    mapped_type <- cluster_mapping %>%
+      dplyr::filter(seurat_clusters == cluster_id) %>% dplyr::pull(celltype)
+    header <- c("Cluster Analysis",
+                "=============================================",
+                paste("Selected Cluster ID:", cluster_id),
+                paste("Assigned Cell Type :", as.character(mapped_type)),
+                "---------------------------------------------",
+                "Statistically Significant Markers (p_val_adj < 0.05):")
+    mg <- if (cluster_id %in% names(marker_list)) marker_list[[cluster_id]] else character(0)
+    return(u_plot + text_box_grob(header, mg) + plot_layout(widths = c(6.5, 3.5)))
     
-    header_lines <- c(
-      "Cluster Analysis",
-      "=============================================",
-      paste("Selected Cluster ID:", cluster_id),
-      paste("Assigned Cell Type :", as.character(mapped_type)),
-      "---------------------------------------------",
-      "Statistically Significant Markers (p_val_adj < 0.05):"
-    )
+    # ---------- VIEW 3: Spatial Gene Expression ----------
+  } else if (input$view_type == "Spatial Feature Plot (Gene Expression)") {
     
-    marker_genes <- if (cluster_id %in% names(marker_list)) {
-      marker_list[[cluster_id]]
-    } else {
-      character(0)
+    dot_sz <- if (!is.null(input$spatial_dot_size)) input$spatial_dot_size else 1
+    # Compute shared expression ceiling across both genes
+    gene_max <- function(g) {
+      if (g == "General" || !(g %in% rownames(dat))) return(0)
+      max(GetAssayData(dat, assay = "Xenium", layer = "data")[g, ])
     }
+    shared_max <- max(c(gene_max(input$gene_spatial1),
+                        gene_max(input$gene_spatial2), 0.1), na.rm = TRUE)
     
-    t_plot <- text_box_grob(header_lines, marker_genes)
-    
-    return(u_plot + t_plot + plot_layout(widths = c(6.5, 3.5)))
-  }
-  
-  else if (input$view_type == "Spatial Feature Plot (Gene Expression)") {
-    get_ilae_local <- function(fov) {
-      df_sub <- dat@meta.data[dat@meta.data$orig.ident == fov, ]
-      if(nrow(df_sub) == 0) return("Unknown")
-      val <- unique(df_sub$ILAE_score)[1]
-      return(ifelse(is.na(val), "Unknown", as.character(val)))
+    sp <- function(fov, gene) {
+      if (gene == "General") return(build_general_spatial(fov, dot_sz))
+      build_gene_spatial(fov, gene, dot_sz, max_expr = shared_max)
     }
+    return(sp(input$fov1, input$gene_spatial1) +
+             sp(input$fov2, input$gene_spatial2) +
+             plot_layout(ncol = 2))
     
-    max_gene1 <- if (input$gene_spatial1 != "General") gene_max_df[input$gene_spatial1, "max_val"] else 0
-    max_gene2 <- if (input$gene_spatial2 != "General") gene_max_df[input$gene_spatial2, "max_val"] else 0
-    global_max_val <- max(c(max_gene1, max_gene2, 0.1), na.rm = TRUE)
+    # ---------- VIEW 4: Spatial Cell Type ----------
+  } else if (input$view_type == "Spatial Feature Plot (Cell Type)") {
     
-    get_gene_spatial_plot <- function(fov, gene_sel) {
-      ilae_val <- get_ilae_local(fov)
-      if (gene_sel == "General") {
-        return(ImageDimPlot_clean(dat, fov = fov, group.by = "celltype", cols = pal_celltype, size = input$spatial_dot_size, border.size = NA) + 
-                 ggtitle(paste0(fov, " ILAE (", ilae_val, "): General")))
-      } else {
-        # Using the new custom ordered function to enforce high expression on top
-        p <- ImageFeaturePlot_ordered(
-          object = dat, 
-          fov = fov, 
-          features = gene_sel, 
-          size = input$spatial_dot_size, 
-          border.size = NA,
-          order = TRUE
-        ) + 
-          coord_fixed() + theme_void() + 
-          theme(panel.background = element_rect(fill = "white", color = NA)) +
-          ggtitle(paste0(fov, " ILAE (", ilae_val, "): ", gene_sel))
-        
-        p <- suppressMessages(
-          p + scale_fill_gradientn(colors = c("lightgrey", "firebrick1"), limits = c(0, global_max_val))
-        )
-        return(p)
-      }
+    dot_sz <- if (!is.null(input$spatial_dot_size)) input$spatial_dot_size else 1
+    ct <- function(fov, sel) {
+      if (sel == "General") return(build_general_spatial(fov, dot_sz))
+      build_highlighted_spatial(fov, sel, "firebrick1", dot_sz)
     }
+    return(ct(input$fov_ct1, input$celltype_select1) +
+             ct(input$fov_ct2, input$celltype_select2) +
+             plot_layout(ncol = 2))
     
-    return(get_gene_spatial_plot(input$fov1, input$gene_spatial1) + 
-             get_gene_spatial_plot(input$fov2, input$gene_spatial2))
-  }
-  
-  else if (input$view_type == "Spatial Feature Plot (Cell Type)") {
-    get_ct_plot <- function(fov, sel) {
-      df_sub <- dat@meta.data[dat@meta.data$orig.ident == fov, ]
-      ilae_val <- if(nrow(df_sub) > 0) unique(df_sub$ILAE_score)[1] else "Unknown"
-      
-      if (sel == "General") {
-        return(ImageDimPlot_clean(dat, fov = fov, group.by = "celltype", cols = pal_celltype, size = input$spatial_dot_size, border.size = NA) + 
-                 ggtitle(paste0(fov, " ILAE (", ilae_val, "): General")))
-      } else {
-        all_types <- levels(dat$celltype)
-        custom_pal <- setNames(rep("lightgrey", length(all_types)), all_types)
-        custom_pal[sel] <- "firebrick1"
-        
-        cells_in_fov <- colnames(dat)[dat$orig.ident == fov]
-        is_target <- dat$celltype[cells_in_fov] == sel
-        ordered_cells <- c(cells_in_fov[!is_target], cells_in_fov[is_target])
-        
-        return(ImageDimPlot(dat, fov = fov, group.by = "celltype", cols = custom_pal, size = input$spatial_dot_size, border.size = NA, cells = ordered_cells) + 
-                 coord_fixed() + theme_void() + 
-                 theme(panel.background = element_rect(fill = "white", color = NA)) +
-                 ggtitle(paste0(fov, " ILAE (", ilae_val, "): ", sel)))
-      }
-    }
-    return(get_ct_plot(input$fov_ct1, input$celltype_select1) + get_ct_plot(input$fov_ct2, input$celltype_select2))
-  }
-  
-  else if (input$view_type == "Cell Type & Subtype Exploration") {
-    req(input$sub_explore_main_type, input$sub_explore_subtype, input$sub_explore_fov)
+    # ---------- VIEW 5: Cell Type & Subtype Exploration ----------
+  } else if (input$view_type == "Cell Type & Subtype Exploration") {
     
-    p1 <- precomputed_main_umaps[[input$sub_explore_main_type]] + 
-      ggtitle(paste("UMAP:", input$sub_explore_main_type)) + theme_void()
+    main_type <- input$sub_explore_main_type
+    s_type    <- input$sub_explore_subtype
+    fov_sel   <- input$sub_explore_fov
+    dot_sz    <- if (!is.null(input$spatial_dot_size)) input$spatial_dot_size else 1
+    if (is.null(main_type) || is.null(s_type) || is.null(fov_sel) || fov_sel == "")
+      return(ggplot() + theme_void() + ggtitle("Select parameters"))
     
-    all_types <- levels(dat_sub$celltype)
-    p1_cols <- setNames(rep("lightgrey", length(all_types)), all_types)
-    p1_cols[input$sub_explore_main_type] <- "#2c3e50"
+    p1 <- build_highlighted_umap(main_type, "#2c3e50")
+    p2 <- build_highlighted_spatial(fov_sel, main_type, "#2c3e50", dot_sz)
     
-    cells_in_fov <- colnames(dat)[dat$orig.ident == input$sub_explore_fov]
-    is_target_main <- dat$celltype[cells_in_fov] == input$sub_explore_main_type
-    ordered_cells_main <- c(cells_in_fov[!is_target_main], cells_in_fov[is_target_main])
-    
-    p2 <- ImageDimPlot(dat, fov = input$sub_explore_fov, group.by = "celltype", cols = p1_cols, size = input$spatial_dot_size, border.size = NA, cells = ordered_cells_main) + 
-      coord_fixed() + theme_void() + ggtitle(paste("Spatial:", input$sub_explore_main_type))
-    
-    p3 <- precomputed_sub_umaps[[input$sub_explore_subtype]] + 
-      ggtitle(paste("UMAP:", input$sub_explore_subtype)) + theme_void()
-    
-    all_subtypes <- unique(as.character(dat_sub$cellsubtype))
-    p3_cols <- setNames(rep("lightgrey", length(all_subtypes)), all_subtypes)
-    p3_cols[input$sub_explore_subtype] <- "#c0392b"
-    
-    is_target_sub <- dat$cellsubtype[cells_in_fov] == input$sub_explore_subtype
-    ordered_cells_sub <- c(cells_in_fov[!is_target_sub], cells_in_fov[is_target_sub])
-    
-    p4 <- ImageDimPlot(dat, fov = input$sub_explore_fov, group.by = "cellsubtype", cols = p3_cols, size = input$spatial_dot_size, border.size = NA, cells = ordered_cells_sub) + 
-      coord_fixed() + theme_void() + ggtitle(paste("Spatial:", input$sub_explore_subtype)) +
-      theme(legend.position = "none")
+    # Subtype UMAP (still use DimPlot — it returns a proper ggplot)
+    all_sub <- unique(na.omit(as.character(dat$cellsubtype_fine)))
+    sub_cols <- setNames(rep("lightgrey", length(all_sub)), all_sub)
+    sub_cols[s_type] <- "#c0392b"
+    p3 <- DimPlot(dat, reduction = "umap", group.by = "cellsubtype_fine",
+                  cols = sub_cols, order = s_type) +
+      coord_fixed() + theme_classic() +
+      theme(legend.position = "none") + ggtitle(paste("UMAP:", s_type))
+
+    # Subtype spatial — uses new helper, no ImageDimPlot
+    p4 <- build_subtype_spatial(fov_sel, s_type, "#c0392b", dot_sz)
     
     return((p1 + p3) / (p2 + p4))
-  }
-  
-  else {
-    return(DimPlot(dat_sub, reduction = "umap", group.by = "celltype", cols = pal_celltype) + 
-             coord_fixed() + ggtitle("General UMAP Layout"))
+    
+  } else {
+    return(build_general_umap() + ggtitle("General UMAP Layout"))
   }
 }
 
-####### SERVER #################################################################
+
+###############################################################################
+#                               SERVER LOGIC                                  #
+###############################################################################
 
 server <- function(input, output, session) {
   
-  #TESTER --> used to test the amount of RAM needed for the shiny app
-  #NOTE: delete this section before publishing the website
-  output$ram_usage <- renderText({
-    invalidateLater(5000, session)
-    mem <- gc(verbose = FALSE)
-    used_mb <- sum(mem[, "used"] * c(56, 8)) / 1024^2
-    paste0("🖥️ System Memory In Use: ", round(used_mb, 1), " MB")
-  })
-  
-  #Makes sure the gene inputted is valid
-  #helps avoid website crashes when plotting
-  is_valid_gene <- function(x, dat) {
-    !is.null(x) && length(x) == 1 && trimws(x) != "" && trimws(x) != "General" && x %in% rownames(dat)
+  is_valid_gene <- function(x) {
+    !is.null(x) && length(x) == 1 && nzchar(trimws(x)) &&
+      trimws(x) != "General" && x %in% genes
   }
   
-  #Allows the plots to be saved
+  # ── Download ──
   output$download_plot <- downloadHandler(
-    filename = function() { paste0("Seurat_plot_", Sys.Date(), ".pdf") },
-    content = function(file) {
+    filename = function() paste0("TLEseq_plot_", Sys.Date(), ".pdf"),
+    content  = function(file) {
       p <- make_current_plot(input)
-      ggplot2::ggsave(filename = file, plot = p, device = grDevices::cairo_pdf, width = 11, height = 8.5)
-    }
-  )
+      ggplot2::ggsave(file, plot = p, device = grDevices::cairo_pdf,
+                      width = 11, height = 8.5)
+    })
   
-  #gets ILAE grade of the selected FOV
-  #Displays the ILAE grade above the plotted spatial plot
-  get_ilae <- function(fov) {
-    df_sub <- dat@meta.data[dat@meta.data$orig.ident == fov, ]
-    if(nrow(df_sub) == 0) return("Unknown")
-    ilae <- unique(df_sub$ILAE_score)[1]
-    if (is.null(ilae) || is.na(ilae)) return("Unknown")
-    return(as.character(ilae))
-  }
-  
-  #Takes the two selected genes for spatial feature plotting
-  #Calculates their gene expression and syncs their scal bars
-  #So that the spatial plots are comparable
+  # ── Shared reactive: global expression ceiling for spatial gene plots ──
   global_spatial_max <- reactive({
     req(input$gene_spatial1, input$gene_spatial2)
-    val1 <- if (input$gene_spatial1 != "General") gene_max_df[input$gene_spatial1, "max_val"] else 0
-    val2 <- if (input$gene_spatial2 != "General") gene_max_df[input$gene_spatial2, "max_val"] else 0
-    max(c(val1, val2, 0.1), na.rm = TRUE) 
+    gmax <- function(g) {
+      if (g == "General" || !(g %in% genes)) return(0)
+      max(GetAssayData(dat, assay = "Xenium", layer = "data")[g, ])
+    }
+    max(c(gmax(input$gene_spatial1), gmax(input$gene_spatial2), 0.1), na.rm = TRUE)
   })
   
-  #generates the first UMAP for UMap + violin plot
-  #The general UMAP will automatically be generated, but will be replaced by
-  #A feature UMAP once a gene has been selected
+  expr_data1 <- reactive({
+    req(input$view_type == "UMAP + Violin Plot", is_valid_gene(input$gene_umap1))
+    df <- FetchData(dat, vars = c(input$gene_umap1, "celltype"))
+    colnames(df)[1] <- "expr"; df
+  })
+  expr_data2 <- reactive({
+    req(input$view_type == "UMAP + Violin Plot", is_valid_gene(input$gene_umap2))
+    df <- FetchData(dat, vars = c(input$gene_umap2, "celltype"))
+    colnames(df)[1] <- "expr"; df
+  })
+  
+  # ═══════════════ VIEW 1: UMAP + VIOLIN PLOT ═══════════════
+  
   output$plot <- renderPlot({
     req(input$view_type == "UMAP + Violin Plot")
-    if (input$gene_umap1 == "General") {
-      DimPlot(dat_sub, reduction = "umap", group.by = "celltype", cols = pal_celltype) + coord_fixed()
-    } else {
-      FeaturePlot(dat_sub, features = input$gene_umap1, reduction = "umap") + coord_fixed()
-    }
+    if (input$gene_umap1 == "General") build_general_umap()
+    else FeaturePlot(dat, features = input$gene_umap1, reduction = "umap") +
+      coord_fixed() + labs(color = "Normalized\nExpression")
   })
-  
-  #generates the second UMAP for UMap + violin plot
   output$plot2 <- renderPlot({
     req(input$view_type == "UMAP + Violin Plot")
-    if (input$gene_umap2 == "General") {
-      DimPlot(dat_sub, reduction = "umap", group.by = "celltype", cols = pal_celltype) + coord_fixed()
-    } else {
-      FeaturePlot(dat_sub, features = input$gene_umap2, reduction = "umap") + coord_fixed()
-    }
+    if (input$gene_umap2 == "General") build_general_umap()
+    else FeaturePlot(dat, features = input$gene_umap2, reduction = "umap") +
+      coord_fixed() + labs(color = "Normalized\nExpression")
   })
-  
-  #generates the first violin plot for UMAP +  violin plot
   output$violinplot1 <- renderPlot({
     req(input$view_type == "UMAP + Violin Plot")
     if (input$gene_umap1 == "General") return(NULL)
-    df <- FetchData(dat_sub, vars = c(input$gene_umap1, "celltype"))
-    colnames(df)[1] <- "expr"
-    ggplot(df, aes(x = celltype, y = expr, fill = celltype)) + 
-      geom_violin(scale = "width", alpha = 0.85, width = 0.6) + 
-      scale_fill_manual(values = pal_celltype) + 
-      theme_classic() + ylab(paste(input$gene_umap1, "Expression"))
+    df <- expr_data1()
+    ggplot(df, aes(celltype, expr, fill = celltype)) +
+      geom_violin(scale = "width", alpha = 0.85, width = 0.6) +
+      scale_fill_manual(values = pal_celltype) + theme_classic() +
+      ylab(paste(input$gene_umap1, "Expression"))
   })
-  
-  #generates the second violin plot for UMAP +  violin plot
   output$violinplot2 <- renderPlot({
     req(input$view_type == "UMAP + Violin Plot")
-    if (!is_valid_gene(input$gene_umap2, dat_sub)) return(NULL)
-    df <- FetchData(dat_sub, vars = c(input$gene_umap2, "celltype"))
-    colnames(df)[1] <- "expr"
-    ggplot(df, aes(x = celltype, y = expr, fill = celltype)) + 
-      geom_violin(scale = "width", alpha = 0.85, width = 0.6) + 
-      scale_fill_manual(values = pal_celltype) + 
-      theme_classic() + ylab(paste(input$gene_umap2, "Expression"))
+    if (input$gene_umap2 == "General") return(NULL)
+    df <- expr_data2()
+    ggplot(df, aes(celltype, expr, fill = celltype)) +
+      geom_violin(scale = "width", alpha = 0.85, width = 0.6) +
+      scale_fill_manual(values = pal_celltype) + theme_classic() +
+      ylab(paste(input$gene_umap2, "Expression"))
   })
   
-  #generates the general UMAP in UMAP cluster selection
+  # ═══════════════ VIEW 2: UMAP CLUSTER SELECTION ═══════════════
+  
   output$cluster_select_plot <- renderPlot({
     req(input$view_type == "UMAP Cluster Selection")
-    DimPlot(dat_sub, reduction = "umap", group.by = "celltype", cols = pal_celltype) + 
-      coord_fixed() + ggtitle("General UMAP Layout")
+    build_general_umap()
   })
-  
-  #Generates the cluster info box in UMAP cluster selection
   output$cluster_info_box <- renderPrint({
     req(input$view_type == "UMAP Cluster Selection", input$selected_cluster_drop)
-    cluster_id  <- input$selected_cluster_drop
-    mapped_type <- cluster_mapping %>% filter(seurat_clusters == cluster_id) %>% pull(celltype)
-    cat("Selected Cluster ID:", cluster_id, "\n")
-    cat("Assigned Cell Type :", as.character(mapped_type), "\n")
+    cid <- input$selected_cluster_drop
+    ct  <- cluster_mapping %>%
+      dplyr::filter(seurat_clusters == cid) %>% dplyr::pull(celltype)
+    cat("Selected Cluster ID:", cid, "\n")
+    cat("Assigned Cell Type :", as.character(ct), "\n")
     cat("---------------------------------------------\n")
-    if (cluster_id %in% names(marker_list)) {
+    if (cid %in% names(marker_list)) {
       cat("Statistically Significant Markers (p_val_adj < 0.05):\n")
-      cat(paste0("  • ", marker_list[[cluster_id]], collapse = "\n"))
+      cat(paste0("   \u2022 ", marker_list[[cid]], collapse = "\n"))
     } else {
       cat("No statistically significant markers calculated for this cluster.")
     }
   })
   
-  #generates the first spatial plot for spatial plot (gene expression)
-  #The general spatial plot will automatically be generated, but will be replaced by
-  #A feature UMAP once a gene has been selected
-  #The user must also select a FOV
+  # ═══════════════ VIEW 3: SPATIAL GENE EXPRESSION ═══════════════
+  
   output$spatial_plot1 <- renderPlot({
-    req(input$view_type == "Spatial Feature Plot (Gene Expression)", input$fov1, input$gene_spatial1)
-    if (input$gene_spatial1 == "General") {
-      return(precomputed_general_plots[[input$fov1]])
-    } else {
-      req(input$spatial_dot_size)
-      ilae_val <- get_ilae(input$fov1)
-      
-      expr_vals <- FetchData(dat, vars = input$gene_spatial1)[, 1]
-      cells_in_fov <- colnames(dat)[dat$orig.ident == input$fov1]
-      fov_expr <- expr_vals[cells_in_fov]
-      ordered_cells <- cells_in_fov[order(fov_expr, decreasing = FALSE)]
-      
-      # Swapped ImageFeaturePlot to ImageFeaturePlot_ordered with order = TRUE
-      p <- ImageFeaturePlot_ordered(dat, fov = input$fov1, features = input$gene_spatial1, size = input$spatial_dot_size, cells = ordered_cells, order = TRUE) +
-        coord_fixed() + theme_void() + 
-        theme(panel.background = element_rect(fill = "white", color = NA)) +
-        ggtitle(paste0(input$fov1, " ILAE (", ilae_val, "): ", input$gene_spatial1))
-      
-      p <- suppressMessages(p + scale_fill_gradientn(colors = c("lightgrey", "firebrick1"), limits = c(0, global_spatial_max())))
-      return(p)
-    }
-  })
-  
-  #generates the second spatial plot for spatial plot (gene expression)
+    req(input$view_type == "Spatial Feature Plot (Gene Expression)",
+        input$fov1, input$gene_spatial1)
+    if (input$gene_spatial1 == "General") return(build_general_spatial(input$fov1, input$spatial_dot_size))
+    req(input$spatial_dot_size)
+    build_gene_spatial(input$fov1, input$gene_spatial1,
+                       input$spatial_dot_size, global_spatial_max())
+  }, res = 144)
   output$spatial_plot2 <- renderPlot({
-    req(input$view_type == "Spatial Feature Plot (Gene Expression)", input$fov2, input$gene_spatial2)
-    if (input$gene_spatial2 == "General") {
-      return(precomputed_general_plots[[input$fov2]])
-    } else {
-      req(input$spatial_dot_size)
-      ilae_val = get_ilae(input$fov2)
-      
-      expr_vals <- FetchData(dat, vars = input$gene_spatial2)[, 1]
-      cells_in_fov <- colnames(dat)[dat$orig.ident == input$fov2]
-      fov_expr <- expr_vals[cells_in_fov]
-      ordered_cells <- cells_in_fov[order(fov_expr, decreasing = FALSE)]
-      
-      # Swapped ImageFeaturePlot to ImageFeaturePlot_ordered with order = TRUE
-      p <- ImageFeaturePlot_ordered(dat, fov = input$fov2, features = input$gene_spatial2, size = input$spatial_dot_size, cells = ordered_cells, order = TRUE) +
-        coord_fixed() + theme_void() + 
-        theme(panel.background = element_rect(fill = "white", color = NA)) +
-        ggtitle(paste0(input$fov2, " ILAE (", ilae_val, "): ", input$gene_spatial2))
-      
-      p <- suppressMessages(p + scale_fill_gradientn(colors = c("lightgrey", "firebrick1"), limits = c(0, global_spatial_max())))
-      return(p)
-    }
-  })
+    req(input$view_type == "Spatial Feature Plot (Gene Expression)",
+        input$fov2, input$gene_spatial2)
+    if (input$gene_spatial2 == "General") return(build_general_spatial(input$fov2, input$spatial_dot_size))
+    req(input$spatial_dot_size)
+    build_gene_spatial(input$fov2, input$gene_spatial2,
+                       input$spatial_dot_size, global_spatial_max())
+  }, res = 144)
   
-  #generates the first spatial plot for spatial plot (cell type)
-  #Uses the same process as the above spatial plotting,
-  #except this uses cell type instead of gene expression
+  # ═══════════════ VIEW 4: SPATIAL CELL TYPE ═══════════════
+  
   output$spatial_ct_plot1 <- renderPlot({
     req(input$view_type == "Spatial Feature Plot (Cell Type)", input$fov_ct1)
-    label_text <- if(input$celltype_select1 == "General") "General" else input$celltype_select1
-    if (input$celltype_select1 == "General") {
-      return(precomputed_general_plots[[input$fov_ct1]])
-    } else {
-      req(input$spatial_dot_size)
-      ilae_val  = get_ilae(input$fov_ct1)
-      all_types <- levels(dat$celltype)
-      custom_pal <- setNames(rep("lightgrey", length(all_types)), all_types)
-      custom_pal[input$celltype_select1] <- "firebrick1"
-      
-      cells_in_fov <- colnames(dat)[dat$orig.ident == input$fov_ct1]
-      is_target <- dat$celltype[cells_in_fov] == input$celltype_select1
-      ordered_cells <- c(cells_in_fov[!is_target], cells_in_fov[is_target])
-      
-      ImageDimPlot(dat, fov = input$fov_ct1, group.by = "celltype", cols = custom_pal, size = input$spatial_dot_size, cells = ordered_cells) + 
-        coord_fixed() + theme_void() + ggtitle(paste0(input$fov_ct1, " ILAE (", ilae_val, "): ", label_text))
-    }
-  })
-  
-  #generates the second spatial plot for spatial plot (cell type)
+    if (input$celltype_select1 == "General") return(build_general_spatial(input$fov_ct1, input$spatial_dot_size))
+    req(input$spatial_dot_size)
+    build_highlighted_spatial(input$fov_ct1, input$celltype_select1,
+                              "firebrick1", input$spatial_dot_size)
+  }, res = 144)
   output$spatial_ct_plot2 <- renderPlot({
     req(input$view_type == "Spatial Feature Plot (Cell Type)", input$fov_ct2)
-    label_text <- if(input$celltype_select2 == "General") "General" else input$celltype_select2
-    if (input$celltype_select2 == "General") {
-      return(precomputed_general_plots[[input$fov_ct2]])
-    } else {
-      req(input$spatial_dot_size)
-      ilae_val  <- get_ilae(input$fov_ct2)
-      all_types <- levels(dat$celltype)
-      custom_pal <- setNames(rep("lightgrey", length(all_types)), all_types)
-      custom_pal[input$celltype_select2] <- "firebrick1"
-      
-      cells_in_fov <- colnames(dat)[dat$orig.ident == input$fov_ct2]
-      is_target <- dat$celltype[cells_in_fov] == input$celltype_select2
-      ordered_cells <- c(cells_in_fov[!is_target], cells_in_fov[is_target])
-      
-      ImageDimPlot(dat, fov = input$fov_ct2, group.by = "celltype", cols = custom_pal, size = input$spatial_dot_size, cells = ordered_cells) + 
-        coord_fixed() + theme_void() + theme(panel.background = element_rect(fill = "white", color = NA)) +
-        ggtitle(paste0(input$fov_ct2, " ILAE (", ilae_val, "): ", label_text))
-    }
-  })
+    if (input$celltype_select2 == "General") return(build_general_spatial(input$fov_ct2, input$spatial_dot_size))
+    req(input$spatial_dot_size)
+    build_highlighted_spatial(input$fov_ct2, input$celltype_select2,
+                              "firebrick1", input$spatial_dot_size)
+  }, res = 144)
   
-  #Generates the precomputed feature UMAP for cell type
+  # ═══════════════ VIEW 5: CELL TYPE & SUBTYPE EXPLORATION ═══════════════
+  
   output$sub_explore_main_umap <- renderPlot({
-    req(input$view_type == "Cell Type & Subtype Exploration", input$sub_explore_main_type)
-    precomputed_main_umaps[[input$sub_explore_main_type]]
+    req(input$view_type == "Cell Type & Subtype Exploration",
+        input$sub_explore_main_type)
+    build_highlighted_umap(input$sub_explore_main_type, "#2c3e50")
   })
-  
-  #Generates the feature spatial plots for cell type
   output$sub_explore_main_spatial <- renderPlot({
-    req(input$view_type == "Cell Type & Subtype Exploration", input$sub_explore_main_type, input$sub_explore_fov, input$spatial_dot_size)
-    all_types <- levels(dat$celltype)
-    custom_colors <- setNames(rep("lightgrey", length(all_types)), all_types)
-    custom_colors[input$sub_explore_main_type] <- "#2c3e50"
-    ilae_val <- get_ilae(input$sub_explore_fov)
-    
-    cells_in_fov <- colnames(dat)[dat$orig.ident == input$sub_explore_fov]
-    is_target <- dat$celltype[cells_in_fov] == input$sub_explore_main_type
-    ordered_cells <- c(cells_in_fov[!is_target], cells_in_fov[is_target])
-    
-    ImageDimPlot(dat, fov = input$sub_explore_fov, group.by = "celltype", cols = custom_colors, size = input$spatial_dot_size, cells = ordered_cells) + 
-      coord_fixed() + theme_void() + 
-      ggtitle(paste0(input$sub_explore_fov, " (", ilae_val, ") - ", input$sub_explore_main_type))
-  })
+    req(input$view_type == "Cell Type & Subtype Exploration",
+        input$sub_explore_main_type, input$sub_explore_fov, input$spatial_dot_size)
+    build_highlighted_spatial(input$sub_explore_fov, input$sub_explore_main_type,
+                              "#2c3e50", input$spatial_dot_size)
+  }, res = 144)
   
-  #Allows the cell subtype dropdown menu to appear after the general
-  #Cell type has been selected
   output$dynamic_subtype_ui <- renderUI({
-    req(input$view_type == "Cell Type & Subtype Exploration", input$sub_explore_main_type)
-    
-    available_subtypes <- subtype_mapping %>%
-      filter(celltype == input$sub_explore_main_type) %>%
-      pull(cellsubtype)
-    
-    selectInput("sub_explore_subtype", "Select Cell Subtype:", 
-                choices = sort(available_subtypes))
+    req(input$view_type == "Cell Type & Subtype Exploration",
+        input$sub_explore_main_type)
+    subs <- subtype_mapping %>%
+      dplyr::filter(celltype == input$sub_explore_main_type) %>%
+      dplyr::pull(cellsubtype) %>% unique() %>% sort()
+    selectInput("sub_explore_subtype", "Select Cell Subtype:", choices = subs)
   })
   
-  #Generates the precomputed feature UMAP for cell subtype
   output$sub_explore_sub_umap <- renderPlot({
-    req(input$view_type == "Cell Type & Subtype Exploration", input$sub_explore_subtype)
-    precomputed_sub_umaps[[input$sub_explore_subtype]]
+    req(input$view_type == "Cell Type & Subtype Exploration",
+        input$sub_explore_main_type, input$sub_explore_subtype)
+    s_type   <- input$sub_explore_subtype
+    all_sub  <- unique(na.omit(as.character(dat$cellsubtype_fine)))
+    sub_cols <- setNames(rep("lightgrey", length(all_sub)), all_sub)
+    sub_cols[s_type] <- "#c0392b"
+    DimPlot(dat, reduction = "umap", group.by = "cellsubtype_fine",
+            cols = sub_cols, order = s_type) +
+      coord_fixed() + theme_classic() +
+      theme(legend.position = "none") + ggtitle(paste("UMAP:", s_type))
   })
   
-  #Generates the feature spatial plots for cell subtype
   output$sub_explore_sub_spatial <- renderPlot({
-    req(input$view_type == "Cell Type & Subtype Exploration", input$sub_explore_subtype, input$sub_explore_fov, input$spatial_dot_size)
-    all_subtypes <- unique(as.character(dat$cellsubtype))
-    custom_colors <- setNames(rep("lightgrey", length(all_subtypes)), all_subtypes)
-    custom_colors[input$sub_explore_subtype] <- "#c0392b"
-    ilae_val <- get_ilae(input$sub_explore_fov)
-    
-    cells_in_fov <- colnames(dat)[dat$orig.ident == input$sub_explore_fov]
-    is_target <- dat$cellsubtype[cells_in_fov] == input$sub_explore_subtype
-    ordered_cells <- c(cells_in_fov[!is_target], cells_in_fov[is_target])
-    
-    ImageDimPlot(dat, fov = input$sub_explore_fov, group.by = "cellsubtype", cols = custom_colors, size = input$spatial_dot_size, cells = ordered_cells) + 
-      coord_fixed() + theme_void() + 
-      ggtitle(paste0(input$sub_explore_fov, " (", ilae_val, ") - ", input$sub_explore_subtype)) +
-      theme(legend.position = "none")
-  })
+    req(input$view_type == "Cell Type & Subtype Exploration",
+        input$sub_explore_subtype, input$sub_explore_fov, input$spatial_dot_size)
+    build_subtype_spatial(input$sub_explore_fov, input$sub_explore_subtype,
+                          "#c0392b", input$spatial_dot_size)
+  }, res = 144)
 }
 
-### RUN APP ####################################################################
-shinyApp(ui, server)
 
+###############################################################################
+# LAUNCH                                                                      #
+###############################################################################
+
+shinyApp(ui, server)
